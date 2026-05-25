@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pbr-capture-synthetic"
+version = "0.1.0"
+description = "Mitsuba 3 multi-view synthetic indoor capture pipeline for PBR / inverse rendering benchmarks"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not mitsuba_slow' --strict-markers -q"
+markers = [
+    "mitsuba_slow: tests that perform real Mitsuba renders (opt-in via -m mitsuba_slow)",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src"]
+ignore_missing_imports = true
+allow_untyped_decorators = true
+warn_unused_ignores = false
+# Override mitsuba's broken shipped .pyi (it has an invalid `as` alias with a
+# dotted name) with our own Any-typed shim under `stubs/`.
+mypy_path = ["stubs"]
