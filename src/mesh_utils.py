@@ -414,20 +414,33 @@ def _tessellate_face_grid(
     return pos, uvs, faces, n
 
 
-def _tessellate_and_bake(
+def _tessellate_shape(
     positions: NDArray[np.float64],
-    uvs: NDArray[np.float64],
     faces: NDArray[np.int64],
-    texture: NDArray[np.uint8],
     target_spacing: float,
+    *,
+    uvs: NDArray[np.float64] | None = None,
+    texture: NDArray[np.uint8] | None = None,
+    flat_color: NDArray[np.uint8] | None = None,
 ) -> trimesh.Trimesh:
-    """Adaptive subdivision + per-vertex bilinear texture bake.
+    """Adaptive subdivision + per-vertex color assignment.
 
     Per face, choose ``n = max(1, ceil(max_edge / target_spacing))`` and
-    subdivide into a barycentric grid. Each new vertex's color is a bilinear
-    sample of ``texture`` at its interpolated UV. Faces are processed in
-    batches grouped by ``n`` so the inner loop runs at most ``max(n)`` times.
+    subdivide into a barycentric grid. Faces are processed in batches grouped
+    by ``n`` so the inner loop runs at most ``max(n)`` times.
+
+    Color source:
+      - If ``texture`` and ``uvs`` are both provided, each new vertex's color
+        is a bilinear sample of ``texture`` at its interpolated UV.
+      - Otherwise ``flat_color`` (uint8 shape ``(3,)``) is broadcast to every
+        new vertex. Used for flat-RGB BSDFs and for textured BSDFs whose OBJ
+        has no usable UV data.
     """
+    use_texture = texture is not None and uvs is not None
+    if not use_texture and flat_color is None:
+        raise ValueError(
+            "_tessellate_shape requires either (texture + uvs) or flat_color"
+        )
     if faces.size == 0:
         return trimesh.Trimesh(
             vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64),
@@ -435,7 +448,6 @@ def _tessellate_and_bake(
         )
 
     corners = positions[faces]      # F x 3 x 3
-    corner_uvs = uvs[faces]         # F x 3 x 2
     edges = np.stack(
         [
             np.linalg.norm(corners[:, 1] - corners[:, 0], axis=-1),
@@ -446,6 +458,11 @@ def _tessellate_and_bake(
     )
     max_edge = edges.max(axis=-1)
     n_per_face = np.maximum(1, np.ceil(max_edge / target_spacing).astype(np.int64))
+
+    corner_uvs: NDArray[np.float64] | None = None  # F x 3 x 2
+    if use_texture:
+        assert uvs is not None  # guaranteed by use_texture
+        corner_uvs = uvs[faces]
 
     out_pos: list[NDArray[np.float64]] = []
     out_col: list[NDArray[np.uint8]] = []
@@ -461,14 +478,21 @@ def _tessellate_and_bake(
         bary = _bary_grid_vertices(n)
         grid_faces = _bary_grid_faces(n)
         k = bary.shape[0]
-        group_corners = corners[mask]      # f_n x 3 x 3
-        group_uvs = corner_uvs[mask]       # f_n x 3 x 2
-        pos = np.einsum("kb,fbc->fkc", bary, group_corners)  # f_n x k x 3
-        uv = np.einsum("kb,fbc->fkc", bary, group_uvs)       # f_n x k x 2
-
+        group_corners = corners[mask]                            # f_n x 3 x 3
+        pos = np.einsum("kb,fbc->fkc", bary, group_corners)      # f_n x k x 3
         pos_flat = pos.reshape(-1, 3)
-        uv_flat = uv.reshape(-1, 2)
-        col_flat = _bilinear_sample(texture, uv_flat)         # (f_n * k) x 3
+
+        if use_texture:
+            assert corner_uvs is not None and texture is not None
+            group_uvs = corner_uvs[mask]                         # f_n x 3 x 2
+            uv = np.einsum("kb,fbc->fkc", bary, group_uvs)       # f_n x k x 2
+            uv_flat = uv.reshape(-1, 2)
+            col_flat = _bilinear_sample(texture, uv_flat)        # (f_n * k) x 3
+        else:
+            assert flat_color is not None
+            col_flat = np.broadcast_to(
+                flat_color, (pos_flat.shape[0], 3),
+            ).copy()
 
         repeated = np.tile(grid_faces[None, :, :], (f_n, 1, 1))
         offsets = (np.arange(f_n) * k)[:, None, None]
@@ -490,6 +514,13 @@ def _tessellate_and_bake(
     mesh = trimesh.Trimesh(vertices=new_positions, faces=new_faces, process=False)
     mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, vertex_colors=rgba)
     return mesh
+
+
+def _rgb_to_uint8(color: tuple[float, float, float]) -> NDArray[np.uint8]:
+    """Convert linear [0, 1] RGB to uint8 (3,)."""
+    return np.array(
+        [int(round(np.clip(c, 0.0, 1.0) * 255)) for c in color], dtype=np.uint8,
+    )
 
 
 # ---- Top-level loaders ------------------------------------------------------
@@ -564,12 +595,15 @@ def load_scene_mesh(
 
     Args:
         scene_xml: path to ``scene_v3.xml`` (or similar Mitsuba 3 scene file).
-        tessellate_spacing: if set and the BSDF binds a bitmap texture, the
-            shape's faces are adaptively subdivided so world-space edges don't
-            exceed this spacing (meters), and each vertex's color is a
-            bilinear sample of the texture. Shapes without a texture, or with
-            invalid UVs, fall back to single-color flat shading. ``None``
-            (default) disables tessellation entirely.
+        tessellate_spacing: when set, every shape's faces are adaptively
+            subdivided so world-space edges don't exceed this spacing (meters).
+            Shapes whose BSDF binds a bitmap texture (and whose OBJ has valid
+            UVs) get per-vertex colors via bilinear texture sampling; all
+            other shapes get the BSDF's solid color broadcast to every new
+            vertex. This produces a roughly uniform face size across the
+            whole scene (useful for 3DGS init). ``None`` (default) disables
+            tessellation entirely and keeps the original geometry with a
+            single color per shape.
         simplify_dense_meshes: when True, decimate any individual mesh with
             more than ``simplify_vertex_threshold`` vertices via
             ``trimesh.simplify_quadric_decimation``.
@@ -622,18 +656,92 @@ def load_scene_mesh(
             and uv_arr.shape == (len(mesh.vertices), 2)
         )
 
-        if do_tessellate and tex_img is not None and has_valid_uv:
-            assert uv_arr is not None  # for mypy
+        color_rgb = (
+            materials.get(b.bsdf_id, _DEFAULT_MESH_COLOR)
+            if b.bsdf_id is not None
+            else _DEFAULT_MESH_COLOR
+        )
+
+        if do_tessellate:
             positions = np.asarray(mesh.vertices, dtype=np.float64)
             faces = np.asarray(mesh.faces, dtype=np.int64)
-            tessellated = _tessellate_and_bake(
-                positions, uv_arr, faces, tex_img, spacing,
+            use_texture = tex_img is not None and has_valid_uv
+
+            # Skip tessellation entirely when every face is already fine enough.
+            # This avoids exploding already-dense meshes (e.g. the bedroom
+            # carpet with ~3mm edges) into 3x as many duplicated corner verts.
+            corners_for_check = positions[faces]
+            edges_for_check = np.stack(
+                [
+                    np.linalg.norm(
+                        corners_for_check[:, 1] - corners_for_check[:, 0], axis=-1,
+                    ),
+                    np.linalg.norm(
+                        corners_for_check[:, 2] - corners_for_check[:, 1], axis=-1,
+                    ),
+                    np.linalg.norm(
+                        corners_for_check[:, 0] - corners_for_check[:, 2], axis=-1,
+                    ),
+                ],
+                axis=-1,
             )
+            needs_subdivision = bool((edges_for_check > spacing).any())
+
+            if not needs_subdivision:
+                if use_texture:
+                    assert uv_arr is not None and tex_img is not None
+                    colors_rgb = _bilinear_sample(tex_img, uv_arr)
+                    rgba = np.concatenate(
+                        [
+                            colors_rgb,
+                            np.full((colors_rgb.shape[0], 1), 255, dtype=np.uint8),
+                        ],
+                        axis=-1,
+                    )
+                    mesh.visual = trimesh.visual.ColorVisuals(
+                        mesh=mesh, vertex_colors=rgba,
+                    )
+                    parts.append(mesh)
+                    mode = "fine_texture"
+                else:
+                    flat = _apply_flat_color(mesh, color_rgb)
+                    parts.append(flat)
+                    mode = "fine_flat"
+                summary.append({
+                    "shape": b.obj_path.name,
+                    "bsdf": b.bsdf_id,
+                    "mode": mode,
+                    "texture": tex_path.name if tex_path is not None else None,
+                    "in_verts": int(positions.shape[0]),
+                    "in_faces": int(faces.shape[0]),
+                    "out_verts": int(positions.shape[0]),
+                    "out_faces": int(faces.shape[0]),
+                })
+                continue
+
+            if use_texture:
+                assert uv_arr is not None  # for mypy
+                tessellated = _tessellate_shape(
+                    positions, faces, spacing,
+                    uvs=uv_arr, texture=tex_img,
+                )
+                mode = "tessellated_texture"
+            else:
+                tessellated = _tessellate_shape(
+                    positions, faces, spacing,
+                    flat_color=_rgb_to_uint8(color_rgb),
+                )
+                mode = "tessellated_flat"
+            # Tessellation emits one corner-vertex copy per face; adjacent
+            # faces share their edge verts at the same world position with
+            # identical colors. Dedup within this shape only -- merging
+            # across shapes would risk collapsing genuine seams.
+            tessellated.merge_vertices()
             parts.append(tessellated)
             summary.append({
                 "shape": b.obj_path.name,
                 "bsdf": b.bsdf_id,
-                "mode": "tessellated",
+                "mode": mode,
                 "texture": tex_path.name if tex_path is not None else None,
                 "in_verts": int(positions.shape[0]),
                 "in_faces": int(faces.shape[0]),
@@ -642,11 +750,6 @@ def load_scene_mesh(
             })
             continue
 
-        color_rgb = (
-            materials.get(b.bsdf_id, _DEFAULT_MESH_COLOR)
-            if b.bsdf_id is not None
-            else _DEFAULT_MESH_COLOR
-        )
         flat = _apply_flat_color(mesh, color_rgb)
         parts.append(flat)
         summary.append({
@@ -663,8 +766,18 @@ def load_scene_mesh(
     if not parts:
         return None
     concatenated: trimesh.Trimesh = trimesh.util.concatenate(parts)
+    # Drop degenerate triangles: zero-area or repeated-index faces. These can
+    # come from sliver source triangles whose corners collapsed after
+    # ``merge_vertices``, or from malformed OBJ input. MeshLab counts them as
+    # errors and 3DGS bootstrappers may divide-by-zero on them.
+    n_faces_before = int(len(concatenated.faces))
+    concatenated.update_faces(concatenated.nondegenerate_faces())
+    n_degenerate = n_faces_before - int(len(concatenated.faces))
+    if n_degenerate > 0:
+        log.info("Removed %d degenerate faces", n_degenerate)
     concatenated.metadata = dict(concatenated.metadata or {})
     concatenated.metadata["mesh_export_summary"] = summary
+    concatenated.metadata["mesh_export_degenerate_removed"] = n_degenerate
     return concatenated
 
 

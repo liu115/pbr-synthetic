@@ -135,11 +135,21 @@ def _load_mesh_for_viewer(
     """
     ply_path = data_dir / "scene.ply"
     if ply_path.exists():
+        size_mb = ply_path.stat().st_size / (1024 * 1024)
         loaded = trimesh.load(str(ply_path), process=False, force="mesh")
         if isinstance(loaded, trimesh.Trimesh):
-            log.info("Loaded pre-baked mesh: %s", ply_path)
+            log.info(
+                "Loaded mesh from %s (%.1f MB, %d verts, %d faces)",
+                ply_path, size_mb, len(loaded.vertices), len(loaded.faces),
+            )
             return loaded
         log.warning("Could not load %s as a mesh; falling back to XML.", ply_path)
+    else:
+        log.warning(
+            "No scene.ply in %s; rebuilding flat-colored mesh from XML. "
+            "Re-run the renderer (or use --only-ply) to bake a tessellated PLY.",
+            data_dir,
+        )
     if scene_xml is None or not scene_xml.exists():
         return None
     return load_scene_mesh(scene_xml)

@@ -485,9 +485,9 @@ def test_export_colored_mesh_ply_tessellated_bakes_texture(tmp_path: Path) -> No
     assert result is not None
     # Source had 3 verts; tessellation must have added many more.
     assert result.total_verts > 50
-    # The summary records this shape as tessellated.
+    # The summary records this shape as a texture bake.
     modes = {s["mode"] for s in result.per_shape}
-    assert modes == {"tessellated"}
+    assert modes == {"tessellated_texture"}
 
     loaded = trimesh.load(str(ply), process=False, force="mesh")
     assert isinstance(loaded, trimesh.Trimesh)
@@ -549,12 +549,53 @@ def test_export_colored_mesh_ply_mixed_tessellated_and_flat(tmp_path: Path) -> N
     result = export_colored_mesh_ply(xml, ply, tessellate_spacing=0.10)
     assert result is not None
     modes = {s["shape"]: s["mode"] for s in result.per_shape}
-    assert modes["textured.obj"] == "tessellated"
-    assert modes["flat.obj"] == "flat"
-    # Textured shape grew, flat shape stayed at 3 verts.
+    # The 1m textured triangle has edges > 10cm so it's subdivided.
+    assert modes["textured.obj"] == "tessellated_texture"
+    # The 1cm flat triangle is already finer than spacing -> "fine_flat"
+    # (no extra verts emitted; this is the fast path for already-dense shapes
+    # like the bedroom carpet).
+    assert modes["flat.obj"] == "fine_flat"
     by_shape = {s["shape"]: s for s in result.per_shape}
     assert by_shape["textured.obj"]["out_verts"] > 3
     assert by_shape["flat.obj"]["out_verts"] == 3
+
+
+def test_export_colored_mesh_ply_tessellates_large_flat_shape(tmp_path: Path) -> None:
+    """A large flat-rgb triangle gets tessellated (N>1) with uniform color."""
+    from src.mesh_utils import export_colored_mesh_ply
+
+    obj_dir = tmp_path / "models"
+    obj_dir.mkdir()
+    # 2m right triangle; longest edge sqrt(8) ~= 2.83. At 10cm spacing N=29.
+    (obj_dir / "wall.obj").write_text(
+        "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n"
+    )
+    xml = _write_scene_xml(
+        tmp_path,
+        """
+        <bsdf type="diffuse" id="WallBSDF">
+            <rgb name="reflectance" value="0.8, 0.8, 0.8"/>
+        </bsdf>
+        <shape type="obj">
+            <string name="filename" value="models/wall.obj"/>
+            <ref id="WallBSDF"/>
+        </shape>
+        """,
+    )
+    ply = tmp_path / "scene.ply"
+    result = export_colored_mesh_ply(xml, ply, tessellate_spacing=0.10)
+    assert result is not None
+    # Tessellation order N >= ceil(sqrt(8) / 0.1) = 29 -> >= (30*31/2) = 465 verts.
+    assert result.total_verts >= 465
+    assert {s["mode"] for s in result.per_shape} == {"tessellated_flat"}
+    # Every vertex should be the same uniform gray (0.8 * 255 = 204).
+    loaded = trimesh.load(str(ply), process=False, force="mesh")
+    assert isinstance(loaded, trimesh.Trimesh)
+    vc = np.asarray(loaded.visual.vertex_colors)
+    assert (vc[:, 0] == vc[0, 0]).all()
+    assert (vc[:, 1] == vc[0, 1]).all()
+    assert (vc[:, 2] == vc[0, 2]).all()
+    assert abs(int(vc[0, 0]) - 204) <= 1
 
 
 def test_export_colored_mesh_ply_tessellation_disabled(tmp_path: Path) -> None:

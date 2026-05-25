@@ -74,6 +74,21 @@ If a previous run was interrupted, rerun the same command with the same `--seed`
 Frames whose `rgb_hdr/{idx:04d}.exr` already exists are skipped; the tonemap +
 JSON-writing pass is always re-run from the available HDRs.
 
+### Regenerate just the PLY
+
+Use `--only-ply` to rewrite `<output>/scene.ply` from the current scene XML
+without touching anything else (no camera sampling, no Mitsuba renders).
+Takes seconds; convenient when you've changed `--tessellate-spacing`,
+turned `--simplify-dense-meshes` on/off, or pulled a new commit with a
+mesh-export fix:
+
+```bash
+conda run -n mitsuba python -m src.render_scene \
+    --scene .../scene_v3.xml \
+    --output /path/to/existing/output \
+    --only-ply
+```
+
 ## Output schema
 
 ```
@@ -99,11 +114,15 @@ Per-pixel `roughness` / `metallic` come from a per-shape best-effort lookup
 BSDFs) they evaluate to `roughness=1.0`, `metallic=0.0`.
 
 `scene.ply` is a colored mesh suitable for 3DGS initialization. By default,
-faces of textured shapes are adaptively subdivided to ~10 cm world-space
-resolution and each new vertex's color is bilinearly sampled from the BSDF
-texture. Flat-`<rgb>` BSDFs keep their single-color-per-shape representation.
-`metadata.mesh_export` records the spacing, simplify settings, total vert /
-face counts, and a per-shape mode summary.
+every shape's faces are adaptively subdivided so world-space edges are
+≤ `--tessellate-spacing` (default 10 cm). Textured shapes get per-vertex
+colors via bilinear texture sampling; flat-`<rgb>` shapes (walls, ceiling,
+etc.) get the BSDF's solid color broadcast to every new vertex. Shapes whose
+faces are already finer than the spacing (e.g. an over-subdivided carpet)
+skip subdivision and color the original vertices in place — no wasteful
+duplication. `metadata.mesh_export.per_shape[*].mode` records one of
+`tessellated_texture`, `tessellated_flat`, `fine_texture`, `fine_flat`, or
+`flat` (when `--no-tessellate`).
 
 ## Visualizer
 

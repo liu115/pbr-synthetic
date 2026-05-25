@@ -76,13 +76,13 @@ log = logging.getLogger(__name__)
 DEFAULT_FULL_W, DEFAULT_FULL_H = 640, 480
 DEFAULT_DEBUG_W, DEFAULT_DEBUG_H = 160, 120
 DEFAULT_FILTER_W, DEFAULT_FILTER_H = 160, 90
-DEFAULT_SPP_BEAUTY_FULL = 256
+DEFAULT_SPP_BEAUTY_FULL = 2048
 DEFAULT_SPP_BEAUTY_DEBUG = 64
 DEFAULT_SPP_AOV = 16
 DEFAULT_SPP_FILTER = 4
 DEFAULT_FOV = 60.0
 DEFAULT_NUM_CAMERAS = 200
-DEFAULT_MAX_DEPTH = 16  # Conservative; scene XML can override only if larger.
+DEFAULT_MAX_DEPTH = 8  # Conservative; scene XML can override only if larger.
 DEFAULT_PLACEMENT_MARGIN = 0.5
 DEFAULT_HEIGHT_RANGE = (0.8, 1.8)
 DEFAULT_HEIGHT_MARGIN = 0.3
@@ -132,6 +132,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Optional YAML overrides for placement/height/up_axis/fov.")
     p.add_argument("--no-ply", action="store_true",
                    help="Skip exporting the colored mesh as <output>/scene.ply.")
+    p.add_argument("--only-ply", action="store_true",
+                   help="Only (re)generate <output>/scene.ply and exit. Skips "
+                        "camera sampling, rendering, and JSON writing. Useful "
+                        "for refreshing the PLY after a code change without "
+                        "redoing the slow Mitsuba renders.")
     p.add_argument("--tessellate-spacing", type=float, default=0.10,
                    help="Adaptively subdivide textured faces so world-space "
                         "edges don't exceed this spacing (meters), then "
@@ -313,6 +318,17 @@ def _render_phase(
         log.info("Resuming: %d frames already have HDR EXRs and will be skipped.",
                  len(skip))
 
+    # Placeholder exposure for incremental rgb/ PNGs during the render loop.
+    # The final per-scene exposure isn't known until every HDR is rendered, so
+    # we use a fixed key + a unit exposure here. _tonemap_phase overwrites
+    # rgb/ at the end with the correct per-scene exposure, so this only
+    # affects what you see while a render is in progress (and on a partial
+    # run that gets killed before the tonemap pass).
+    placeholder_exposure = ExposureParams(
+        key=args.tonemap_key, percentile=args.tonemap_percentile,
+        exposure=1.0, gamma=args.tonemap_gamma,
+    )
+
     hdr_images: list[NDArray[np.float32]] = []
     for i, pose in enumerate(poses):
         stem = frame_stem(i)
@@ -331,6 +347,12 @@ def _render_phase(
             spp=rcfg.spp_beauty, max_depth=rcfg.max_depth, seed=seed,
         )
         write_exr(output_dir / "rgb_hdr" / f"{stem}.exr", hdr)
+        # Incremental rgb/ PNG with a placeholder exposure so the user has
+        # something to look at while the render is still running. Overwritten
+        # at the end by the per-scene tonemap pass.
+        write_png_uint8(
+            output_dir / "rgb" / f"{stem}.png", tonemap(hdr, placeholder_exposure),
+        )
 
         aov = render_aov(
             scene, pose, aov_intr,
@@ -480,6 +502,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = _load_scene_config(args.scene_config, args)
     _apply_config_overrides(args, cfg)
+
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    if args.only_ply:
+        ply_path = args.output / "scene.ply"
+        spacing = 0.0 if args.no_tessellate else float(args.tessellate_spacing)
+        result = export_colored_mesh_ply(
+            args.scene, ply_path,
+            tessellate_spacing=(spacing if spacing > 0.0 else None),
+            simplify_dense_meshes=args.simplify_dense_meshes,
+            simplify_vertex_threshold=args.simplify_vertex_threshold,
+        )
+        if result is None:
+            log.error("PLY export failed: no geometry found in %s", args.scene)
+            return 1
+        log.info(
+            "Wrote %s (%d verts, %d faces). Done.",
+            result.path, result.total_verts, result.total_faces,
+        )
+        return 0
 
     rng = _set_seeds(args.seed)
     variant = init_mitsuba(prefer=args.mitsuba_variant)
