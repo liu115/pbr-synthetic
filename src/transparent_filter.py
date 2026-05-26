@@ -80,18 +80,41 @@ def _shape_references_bsdf(shape: ET.Element, bsdf_ids: set[str]) -> bool:
     return False
 
 
+def _absolutize_filename_strings(root: ET.Element, source_dir: Path) -> None:
+    """Rewrite every ``<string name="filename" value="...">`` to an absolute path.
+
+    Mitsuba resolves these paths relative to the XML file's directory, so a
+    filtered XML living outside the original scene directory would fail to
+    find textures and OBJs. Walk every such element and make the value
+    absolute (relative to ``source_dir``) so the filtered XML is portable.
+    """
+    for elem in root.iter("string"):
+        if elem.get("name") != "filename":
+            continue
+        value = elem.get("value")
+        if value is None:
+            continue
+        p = Path(value)
+        if p.is_absolute():
+            continue
+        elem.set("value", str((source_dir / p).resolve()))
+
+
 def filter_transparent_scene(
     scene_xml: Path, work_dir: Path
 ) -> tuple[Path, FilterReport]:
     """Write a copy of ``scene_xml`` with transparent shapes stripped.
 
     The output path is ``work_dir / scene_filtered.xml`` (the work_dir is
-    created if necessary). If no transparent shapes are found, the original
-    file is copied verbatim and an empty report is returned, so downstream
-    code can always use the returned path.
+    created if necessary). Relative texture/OBJ filenames are rewritten to
+    absolute paths against ``scene_xml.parent`` so the filtered XML can be
+    loaded from any directory. If no transparent shapes are found, the file
+    is still rewritten (rather than byte-copied) so the absolute-path
+    rewrite still applies — callers can always use the returned path.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     out_path = work_dir / "scene_filtered.xml"
+    source_dir = scene_xml.parent.resolve()
 
     tree = ET.parse(scene_xml)
     root = tree.getroot()
@@ -110,10 +133,7 @@ def filter_transparent_scene(
         else:
             kept_count += 1
 
-    if not transparent_ids and not dropped_shape_ids:
-        # Nothing to do — keep the original file byte-for-byte.
-        shutil.copyfile(scene_xml, out_path)
-        return out_path, FilterReport(kept_shape_count=kept_count)
+    _absolutize_filename_strings(root, source_dir)
 
     tree.write(out_path, encoding="utf-8", xml_declaration=True)
     return out_path, FilterReport(

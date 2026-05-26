@@ -11,17 +11,34 @@ from __future__ import annotations
 import numpy as np
 
 from src.render import AOVImages
-from src.render_blender import _SHADER_AOV_INPUT, _SHADER_AOV_NAMES
+from src.render_blender import (
+    _BSDF_METALLIC_DEFAULT,
+    _BSDF_ROUGHNESS_DEFAULT,
+    _BSDF_ROUGHNESS_USES_SOCKET,
+    _SHADER_AOV_NAMES,
+)
 
 
-def test_shader_aov_names_match_principled_sockets() -> None:
-    """The AOV name table must map every declared AOV to a known BSDF socket."""
-    assert set(_SHADER_AOV_INPUT.keys()) == set(_SHADER_AOV_NAMES)
-    # These socket names are the canonical Cycles Principled-BSDF input names
-    # (used both by bpy 3.x and bpy 4.x; the addon-compat patches deal with
-    # any version-specific renames at addon level).
-    assert _SHADER_AOV_INPUT["PixelRoughness"] == "Roughness"
-    assert _SHADER_AOV_INPUT["PixelMetallic"] == "Metallic"
+def test_shader_aov_names_are_unique() -> None:
+    assert sorted(_SHADER_AOV_NAMES) == ["PixelMetallic", "PixelRoughness"]
+
+
+def test_diffuse_bsdf_reports_microfacet_fully_rough() -> None:
+    """Cycles Diffuse BSDF -> roughness = 1.0 under the microfacet convention."""
+    assert _BSDF_ROUGHNESS_DEFAULT["ShaderNodeBsdfDiffuse"] == 1.0
+    assert _BSDF_METALLIC_DEFAULT["ShaderNodeBsdfDiffuse"] == 0.0
+
+
+def test_glossy_anisotropic_bsdf_treated_as_metal() -> None:
+    """Cycles Anisotropic / Glossy nodes are conductors — metallic AOV = 1.0."""
+    assert _BSDF_METALLIC_DEFAULT["ShaderNodeBsdfAnisotropic"] == 1.0
+    assert _BSDF_METALLIC_DEFAULT["ShaderNodeBsdfGlossy"] == 1.0
+
+
+def test_principled_bsdf_reads_socket() -> None:
+    """For Principled, the Roughness socket value is taken directly."""
+    assert "ShaderNodeBsdfPrincipled" in _BSDF_ROUGHNESS_USES_SOCKET
+    assert "ShaderNodeBsdfAnisotropic" in _BSDF_ROUGHNESS_USES_SOCKET
 
 
 def test_aovimages_accepts_new_fields_as_optional() -> None:

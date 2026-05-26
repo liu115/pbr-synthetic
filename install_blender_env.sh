@@ -57,6 +57,7 @@ conda run -n "$ENV_NAME" --no-capture-output pip install \
     "mitsuba==3.5.*" \
     "bpy==4.2.*" \
     numpy \
+    scipy \
     "imageio[freeimage]" \
     trimesh \
     pyyaml \

@@ -140,11 +140,44 @@ def _set_passes(
 # class_renderer_blender_mitsubaScene_3D.py.
 
 _SHADER_AOV_NAMES: tuple[str, ...] = ("PixelRoughness", "PixelMetallic")
-# Map the AOV name to the Principled-BSDF input it samples.
-_SHADER_AOV_INPUT: dict[str, str] = {
-    "PixelRoughness": "Roughness",
-    "PixelMetallic": "Metallic",
+
+# Per-BSDF defaults when interpreting the material under the inverse-rendering
+# convention "(microfacet) roughness + metallic". For BSDFs whose Roughness
+# socket carries a meaningful microfacet roughness (Principled, Anisotropic,
+# Glossy, Glass, Refraction) we read the socket directly. For Diffuse BSDFs,
+# whose Roughness socket is the Oren-Nayar parameter (defaulting to 0 =
+# Lambertian), the equivalent microfacet roughness is 1.0 (fully rough), so
+# we output a constant instead.
+_BSDF_ROUGHNESS_USES_SOCKET: frozenset[str] = frozenset(
+    {
+        "ShaderNodeBsdfPrincipled",
+        "ShaderNodeBsdfAnisotropic",
+        "ShaderNodeBsdfGlossy",
+        "ShaderNodeBsdfGlass",
+        "ShaderNodeBsdfRefraction",
+    }
+)
+_BSDF_ROUGHNESS_DEFAULT: dict[str, float] = {
+    "ShaderNodeBsdfDiffuse": 1.0,        # Lambertian -> fully rough microfacet
+    "ShaderNodeBsdfTranslucent": 1.0,
+    "ShaderNodeBsdfTransparent": 0.0,    # ideal glass
 }
+_BSDF_METALLIC_DEFAULT: dict[str, float] = {
+    "ShaderNodeBsdfDiffuse": 0.0,
+    "ShaderNodeBsdfAnisotropic": 1.0,    # Cycles' glossy/anisotropic ~= metal
+    "ShaderNodeBsdfGlossy": 1.0,
+    "ShaderNodeBsdfGlass": 0.0,          # dielectric
+    "ShaderNodeBsdfRefraction": 0.0,
+    "ShaderNodeBsdfTranslucent": 0.0,
+    "ShaderNodeBsdfTransparent": 0.0,
+}
+# BSDFs we know how to source roughness/metallic from. Everything else
+# (volume, hair, etc.) is skipped — the AOV pass returns 0 for those pixels.
+_RENDERABLE_BSDF_IDS: frozenset[str] = frozenset(
+    set(_BSDF_ROUGHNESS_USES_SOCKET)
+    | set(_BSDF_ROUGHNESS_DEFAULT)
+    | set(_BSDF_METALLIC_DEFAULT)
+)
 
 
 def _register_view_layer_aovs(bpy: Any) -> None:
@@ -160,10 +193,13 @@ def _register_view_layer_aovs(bpy: Any) -> None:
 
 
 def _wire_shader_aov_for_material(mat: Any, aov_name: str, input_name: str) -> None:
-    """Add a ShaderNodeOutputAOV to ``mat`` sourcing from a Principled input.
+    """Add a ShaderNodeOutputAOV sourcing from the material's first BSDF.
 
-    No-op if the material has no Principled BSDF, or if a same-named AOV
-    output already exists (so this function is idempotent across re-renders).
+    Handles Principled, Diffuse, Anisotropic/Glossy, Glass, Refraction, and
+    Translucent BSDF types. When the BSDF lacks the requested socket
+    (e.g. ``Metallic`` on a Diffuse node), we wire a constant: 1.0 for
+    AOV ``PixelMetallic`` on glossy-like BSDFs (Anisotropic, Glossy), 0.0
+    otherwise. Idempotent across re-renders.
     """
     if mat is None or not getattr(mat, "use_nodes", False):
         return
@@ -172,32 +208,54 @@ def _wire_shader_aov_for_material(mat: Any, aov_name: str, input_name: str) -> N
         return
 
     for n in tree.nodes:
-        if n.bl_idname == "ShaderNodeOutputAOV" and getattr(n, "name", "") == aov_name:
+        if n.bl_idname == "ShaderNodeOutputAOV" and getattr(n, "aov_name", "") == aov_name:
             return  # already wired
 
-    principled = None
+    bsdf = None
     for n in tree.nodes:
-        if n.bl_idname == "ShaderNodeBsdfPrincipled":
-            principled = n
+        if n.bl_idname in _RENDERABLE_BSDF_IDS:
+            bsdf = n
             break
-    if principled is None:
-        return
-
-    socket = principled.inputs.get(input_name)
-    if socket is None:
+    if bsdf is None:
         return
 
     aov_node = tree.nodes.new("ShaderNodeOutputAOV")
-    aov_node.name = aov_name
+    # In bpy 4.x ``aov_name`` is the AOV identifier Cycles matches against
+    # the view-layer's registered AOVs. The inherited ``name`` is just the
+    # node's display name and does NOT influence AOV routing. Setting only
+    # ``name`` silently leaves the AOV unidentified, which renders to zero.
+    aov_node.aov_name = aov_name
+    aov_node.name = aov_name  # also set display name for easy inspection
 
-    if socket.is_linked:
+    socket = bsdf.inputs.get(input_name)
+    use_socket = False
+    if socket is not None:
+        if input_name == "Roughness":
+            use_socket = bsdf.bl_idname in _BSDF_ROUGHNESS_USES_SOCKET
+        elif input_name == "Metallic":
+            # Only Principled BSDF actually has microfacet Metallic.
+            use_socket = bsdf.bl_idname == "ShaderNodeBsdfPrincipled"
+
+    if use_socket and socket is not None and socket.is_linked:
         src_socket = socket.links[0].from_socket
-    else:
-        # Materialise the default scalar value into a Value node so it can
-        # drive the AOV output (sockets without links can't be wired directly).
+    elif use_socket and socket is not None:
         val = tree.nodes.new("ShaderNodeValue")
         val.outputs[0].default_value = float(socket.default_value)
         src_socket = val.outputs[0]
+    else:
+        # Wire a constant fall-back based on the BSDF type. This is what
+        # makes diffuse surfaces report as fully rough (1.0) under the
+        # microfacet convention and what makes Cycles' Glossy/Anisotropic
+        # nodes report as metallic (1.0) for the Metallic AOV.
+        defaults = (
+            _BSDF_ROUGHNESS_DEFAULT if aov_name == "PixelRoughness"
+            else _BSDF_METALLIC_DEFAULT
+        )
+        default = defaults.get(bsdf.bl_idname, 0.0)
+        val = tree.nodes.new("ShaderNodeValue")
+        val.outputs[0].default_value = float(default)
+        src_socket = val.outputs[0]
+
     tree.links.new(src_socket, aov_node.inputs["Value"])
 
 
@@ -209,9 +267,10 @@ def setup_shader_aovs(bpy: Any) -> None:
     picked up automatically on the next call.
     """
     _register_view_layer_aovs(bpy)
+    aov_to_input = {"PixelRoughness": "Roughness", "PixelMetallic": "Metallic"}
     for mat in bpy.data.materials:
         for aov_name in _SHADER_AOV_NAMES:
-            _wire_shader_aov_for_material(mat, aov_name, _SHADER_AOV_INPUT[aov_name])
+            _wire_shader_aov_for_material(mat, aov_name, aov_to_input[aov_name])
 
 
 # ---- Compositor setup -------------------------------------------------------

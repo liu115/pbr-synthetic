@@ -77,7 +77,7 @@ def test_bumpmap_wrapper_recurses() -> None:
     )
 
 
-def test_no_transparent_shapes_copies_file_verbatim(tmp_path: Path) -> None:
+def test_no_transparent_shapes_keeps_every_shape(tmp_path: Path) -> None:
     src = _write(
         tmp_path,
         """
@@ -97,10 +97,45 @@ def test_no_transparent_shapes_copies_file_verbatim(tmp_path: Path) -> None:
 
     assert out == work_dir / "scene_filtered.xml"
     assert report == FilterReport(kept_shape_count=1)
-    # Roundtrip: re-parse the output and verify the shape is still present.
     tree = ET.parse(out)
     shapes = tree.getroot().findall("shape")
     assert [s.get("id") for s in shapes] == ["wall"]
+
+
+def test_relative_filename_paths_are_absolutized(tmp_path: Path) -> None:
+    """The filtered XML must carry absolute paths so it loads from any cwd."""
+    src = _write(
+        tmp_path,
+        """
+        <scene version="3.0.0">
+            <bsdf type="twosided" id="WallBSDF">
+                <bsdf type="diffuse">
+                    <texture type="bitmap">
+                        <string name="filename" value="textures/wall.jpg" />
+                    </texture>
+                </bsdf>
+            </bsdf>
+            <shape type="obj" id="wall">
+                <string name="filename" value="models/wall.obj" />
+                <ref id="WallBSDF" />
+            </shape>
+        </scene>
+        """,
+    )
+    work_dir = tmp_path / "_work"
+    out, _ = filter_transparent_scene(src, work_dir)
+
+    tree = ET.parse(out)
+    filenames = [
+        elem.get("value")
+        for elem in tree.getroot().iter("string")
+        if elem.get("name") == "filename"
+    ]
+    # Both filenames must be absolute and rooted at the original scene's dir.
+    expected_obj = str((tmp_path / "models" / "wall.obj").resolve())
+    expected_tex = str((tmp_path / "textures" / "wall.jpg").resolve())
+    assert expected_obj in filenames
+    assert expected_tex in filenames
 
 
 def test_drops_shapes_referencing_dielectric(tmp_path: Path) -> None:
