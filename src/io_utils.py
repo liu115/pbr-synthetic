@@ -16,20 +16,38 @@ from numpy.typing import NDArray
 
 log = logging.getLogger(__name__)
 
-# Output subdirectory names. The first block holds dataset outputs referenced
-# by ``transforms.json``; the second block holds debug visualizations only.
-SUBDIRS: tuple[str, ...] = (
-    "rgb",
-    "rgb_hdr",
+# Per-AOV subdirectories (all rendered by Blender; shared across backends).
+#
+# ``albedo``         = Cycles DiffCol pass (k_d)
+# ``specular_albedo`` = Cycles GlossCol pass (k_s / F0)
+# ``emission``       = Cycles Emit pass
+# ``material_index`` = Cycles IndexMA pass (per-material segmentation)
+# ``roughness`` / ``metallic`` = per-pixel shader-AOV maps
+AOV_SUBDIRS: tuple[str, ...] = (
     "depth",
     "normal",
     "albedo",
+    "specular_albedo",
+    "emission",
+    "material_index",
     "roughness",
     "metallic",
-    # Debug-only LDR PNGs for quick visual inspection.
+)
+DEBUG_SUBDIRS: tuple[str, ...] = (
     "albedo_ldr",
     "depth_rgb",
     "normal_rgb",
+)
+ENVMAP_SUBDIR = "envmap"
+
+# Backwards-compatible legacy alias kept so existing imports continue working
+# during the refactor. New code should use ``aov_layout_subdirs()`` and the
+# per-backend helpers below.
+SUBDIRS: tuple[str, ...] = (
+    "rgb",
+    "rgb_hdr",
+    *AOV_SUBDIRS,
+    *DEBUG_SUBDIRS,
 )
 
 TRANSFORMS_FILENAME = "transforms.json"
@@ -38,6 +56,55 @@ PREVIEW_FILENAME = "preview.png"
 
 # Frame paths follow ``<subdir>/<i:04d>.<ext>``.
 _FRAME_RE = re.compile(r"^(?P<idx>\d{4,})\.(exr|png)$")
+
+
+# ---- Backend-aware layout helpers -------------------------------------------
+
+
+def rgb_subdir(backend: str) -> str:
+    """Return the LDR RGB subdir name for a beauty backend."""
+    return f"rgb_{backend}" if backend not in ("legacy", "") else "rgb"
+
+
+def rgb_hdr_subdir(backend: str) -> str:
+    """Return the HDR EXR subdir name for a beauty backend."""
+    return f"rgb_hdr_{backend}" if backend not in ("legacy", "") else "rgb_hdr"
+
+
+def make_layout(
+    output_dir: Path, backends: list[str], with_envmap: bool = False
+) -> None:
+    """Create the unified output directory tree.
+
+    Per-backend RGB dirs (``rgb_<backend>/`` + ``rgb_hdr_<backend>/``) are
+    created for every entry in ``backends``. All AOV dirs are shared
+    regardless of backend. Debug-visualization dirs are always created.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for backend in backends:
+        (output_dir / rgb_subdir(backend)).mkdir(parents=True, exist_ok=True)
+        (output_dir / rgb_hdr_subdir(backend)).mkdir(parents=True, exist_ok=True)
+    for sub in AOV_SUBDIRS:
+        (output_dir / sub).mkdir(parents=True, exist_ok=True)
+    for sub in DEBUG_SUBDIRS:
+        (output_dir / sub).mkdir(parents=True, exist_ok=True)
+    if with_envmap:
+        (output_dir / ENVMAP_SUBDIR).mkdir(parents=True, exist_ok=True)
+
+
+def existing_rendered_frames_for_backend(
+    output_dir: Path, backend: str
+) -> set[int]:
+    """Frame indices for which the HDR beauty render already exists for ``backend``."""
+    out: set[int] = set()
+    hdr_dir = output_dir / rgb_hdr_subdir(backend)
+    if not hdr_dir.exists():
+        return out
+    for p in hdr_dir.iterdir():
+        m = _FRAME_RE.match(p.name)
+        if m is not None and p.suffix == ".exr":
+            out.add(int(m.group("idx")))
+    return out
 
 
 @dataclass(slots=True, frozen=True)
@@ -143,23 +210,51 @@ def write_transforms_json(
 
 
 def build_frame_record(
-    index: int, transform_c2w: NDArray[Any]
+    index: int,
+    transform_c2w: NDArray[Any],
+    backends: list[str] | None = None,
+    *,
+    with_envmap: bool = False,
 ) -> dict[str, Any]:
-    """Build a single ``frames`` entry for ``transforms.json``."""
+    """Build a single ``frames`` entry for ``transforms.json``.
+
+    When ``backends`` is None (legacy mode) the record uses the un-suffixed
+    ``rgb/`` and ``rgb_hdr/`` paths. When ``backends`` is provided, per-backend
+    paths (``rgb_<backend>/...``) are emitted in addition to the AOV paths.
+    """
     mat = np.asarray(transform_c2w, dtype=np.float64)
     if mat.shape != (4, 4):
         raise ValueError(f"transform must be 4x4; got {mat.shape}")
     stem = frame_stem(index)
-    return {
-        "file_path": f"rgb/{stem}",
+
+    record: dict[str, Any] = {
         "transform_matrix": mat.tolist(),
         "depth_path": f"depth/{stem}.exr",
         "normal_path": f"normal/{stem}.exr",
         "albedo_path": f"albedo/{stem}.exr",
         "roughness_path": f"roughness/{stem}.exr",
         "metallic_path": f"metallic/{stem}.exr",
-        "hdr_path": f"rgb_hdr/{stem}.exr",
     }
+    if backends:
+        # Primary file_path / hdr_path use the first backend so single-backend
+        # consumers don't need to special-case the format. Extra backends get
+        # ``<key>_<backend>`` keys.
+        primary = backends[0]
+        record["file_path"] = f"{rgb_subdir(primary)}/{stem}"
+        record["hdr_path"] = f"{rgb_hdr_subdir(primary)}/{stem}.exr"
+        for b in backends:
+            record[f"file_path_{b}"] = f"{rgb_subdir(b)}/{stem}"
+            record[f"hdr_path_{b}"] = f"{rgb_hdr_subdir(b)}/{stem}.exr"
+        # New AOV paths only exist in the unified pipeline.
+        record["specular_albedo_path"] = f"specular_albedo/{stem}.exr"
+        record["emission_path"] = f"emission/{stem}.exr"
+        record["material_index_path"] = f"material_index/{stem}.exr"
+        if with_envmap:
+            record["envmap_path"] = f"{ENVMAP_SUBDIR}/{stem}.exr"
+    else:
+        record["file_path"] = f"rgb/{stem}"
+        record["hdr_path"] = f"rgb_hdr/{stem}.exr"
+    return record
 
 
 def write_metadata_json(path: Path, metadata: dict[str, Any]) -> None:

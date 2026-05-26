@@ -46,8 +46,25 @@ class SceneInfo:
 
 
 def init_mitsuba(prefer: str | None = None) -> str:
-    """Select and set a Mitsuba variant. Returns the selected variant name."""
+    """Select and set a Mitsuba variant. Returns the selected variant name.
+
+    If a variant is already set on the process, we keep it unless ``prefer``
+    is given and differs — switching variants mid-process triggers Mitsuba's
+    "module reloaded" warning and has been observed to produce all-zero
+    renders. The unified pipeline relies on this behavior so that the
+    scalar variant set by :func:`load_scene_blender` (needed by the
+    mitsuba-blender addon) is preserved.
+    """
     available = set(mi.variants())
+    try:
+        current = mi.variant()
+    except Exception:
+        current = None
+
+    if current and (prefer is None or prefer == current):
+        log.info("Mitsuba variant: %s (already set)", current)
+        return str(current)
+
     candidates: list[str] = []
     if prefer is not None:
         candidates.append(prefer)

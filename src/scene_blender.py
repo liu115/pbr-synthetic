@@ -581,6 +581,19 @@ def load_scene_blender(
             "(call ensure_mitsuba_addon() first)."
         )
 
+    # The mitsuba-blender addon parses the scene XML via Mitsuba internally.
+    # If a previous call set an AD variant (e.g. cuda_ad_rgb or llvm_ad_rgb),
+    # scene-parameter reads return drjit AD floats and the addon's RGB
+    # spectrum writer raises ``TypeError: expected sequence items of type
+    # float, not drjit.cuda.ad.Float``. Force a non-AD variant for the
+    # duration of the import; the caller can switch back to a faster variant
+    # afterwards.
+    try:
+        import mitsuba as _mi
+        _mi.set_variant("scalar_rgb")
+    except Exception as e:  # pragma: no cover - very unusual install
+        log.warning("Could not force scalar_rgb before scene import: %s", e)
+
     log.info("Importing Mitsuba scene: %s", scene_xml)
     bpy.ops.import_scene.mitsuba(filepath=str(scene_xml))
 

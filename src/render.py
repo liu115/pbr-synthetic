@@ -1,10 +1,21 @@
-"""Mitsuba sensor construction, beauty + AOV rendering, BSDF param probing."""
+"""Mitsuba beauty rendering + shared AOV / RenderConfig dataclasses.
+
+Since the FIPT-parity refactor, **all AOVs and the depth-validity filter
+are rendered with Blender Cycles** (see ``src/render_blender.py``). The
+Mitsuba side keeps only the beauty pass — ``render_beauty`` — plus the
+shared dataclasses (``AOVImages``, ``RenderConfig``) and small utilities
+(``make_contact_sheet``).
+
+The old Mitsuba AOV path, per-shape material LUT, and depth-filter helpers
+were removed because they produced per-shape constants for roughness and
+metallic; the Blender shader-AOV path now provides true per-pixel maps.
+"""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import mitsuba as mi
 import numpy as np
@@ -16,16 +27,10 @@ from src.pose_utils import pose_to_c2w  # re-exported for backward compatibility
 
 __all__ = [
     "AOVImages",
-    "MaterialMaps",
     "RenderConfig",
-    "derive_material_lut",
     "make_contact_sheet",
-    "material_caveat_message",
-    "materials_from_shape_index",
     "pose_to_c2w",
-    "render_aov",
     "render_beauty",
-    "render_depth_for_filter",
 ]
 
 log = logging.getLogger(__name__)
@@ -57,41 +62,33 @@ class RenderConfig:
 class AOVImages:
     """Decoded AOV channels for one camera.
 
-    The Mitsuba path populates only the first four (geometric) fields. The
-    Blender path populates everything, including per-pixel material maps. The
-    extra fields default to ``None`` so existing Mitsuba call-sites compile
-    unchanged; once the Mitsuba AOV path is removed (planned), these will all
-    become required.
+    All fields are now produced by the Blender backend
+    (:func:`src.render_blender.render_aov_blender`). The four geometric
+    fields are required; the rest are optional only because some unit
+    tests construct fake ``AOVImages`` instances.
     """
 
     depth: NDArray[np.float32]
     normal: NDArray[np.float32]
-    albedo: NDArray[np.float32]               # diffuse color (k_d)
+    albedo: NDArray[np.float32]                          # k_d (Cycles DiffCol)
     shape_index: NDArray[np.int32]
-    # New Blender-only fields (FIPT parity).
-    glossy_color: NDArray[np.float32] | None = None    # k_s (Cycles GlossCol pass)
-    emission: NDArray[np.float32] | None = None        # Cycles Emit pass
-    material_index: NDArray[np.int32] | None = None    # Cycles IndexMA pass
-    roughness_per_pixel: NDArray[np.float32] | None = None  # custom shader AOV
-    metallic_per_pixel: NDArray[np.float32] | None = None   # custom shader AOV
+    glossy_color: NDArray[np.float32] | None = None      # k_s (Cycles GlossCol)
+    emission: NDArray[np.float32] | None = None          # Cycles Emit
+    material_index: NDArray[np.int32] | None = None      # Cycles IndexMA
+    roughness_per_pixel: NDArray[np.float32] | None = None  # shader AOV
+    metallic_per_pixel: NDArray[np.float32] | None = None   # shader AOV
 
 
-@dataclass(slots=True, frozen=True)
-class MaterialMaps:
-    roughness: NDArray[np.float32]
-    metallic: NDArray[np.float32]
-
-
-# AOV column layout when using the AOV integrator below: 0..2 = RGB from inner
-# integrator, 3 = depth (t-distance), 4..6 = sh_normal, 7..9 = albedo, 10 =
-# shape_index. Channels 0..2 are unused by the AOV pass (we get RGB from the
-# beauty pass instead) but the AOV plugin still produces them.
-_AOV_TOTAL_CHANNELS = 11
-_AOV_DEPTH = slice(3, 4)
-_AOV_NORMAL = slice(4, 7)
-_AOV_ALBEDO = slice(7, 10)
-_AOV_SHAPE = slice(10, 11)
-_AOV_SPEC = "depth:depth,nn:sh_normal,alb:albedo,sid:shape_index"
+# Rotation that maps Mitsuba's Y-up world to Blender's Z-up world (this is what
+# the mitsuba-blender addon applies on import). Multiplying on the LEFT
+# transforms vectors / matrices from Mitsuba space into Blender space.
+_M_Y_UP_TO_Z_UP: NDArray[np.float64] = np.array(
+    [[1.0,  0.0,  0.0, 0.0],
+     [0.0,  0.0, -1.0, 0.0],
+     [0.0,  1.0,  0.0, 0.0],
+     [0.0,  0.0,  0.0, 1.0]],
+    dtype=np.float64,
+)
 
 
 def _build_sensor(
@@ -99,16 +96,37 @@ def _build_sensor(
     intrinsics: Intrinsics,
     spp: int,
     sample_seed_offset: int = 0,
+    *,
+    world_axis_transform: NDArray[np.float64] | None = None,
 ) -> mi.Sensor:
-    origin = list(pose.position)
-    target = list(pose.target(distance=1.0))
-    up = pose.world_up().tolist()
+    """Build a Mitsuba sensor for the given pose.
+
+    ``world_axis_transform`` is an optional 4x4 matrix applied to the
+    look-at origin/target/up before passing them to Mitsuba's
+    ``ScalarTransform4f.look_at``. Used to bridge the coordinate-system
+    mismatch when poses are sampled in Blender's Z-up world (because the
+    mitsuba-blender addon rotates the scene on import) but the Mitsuba
+    scene was loaded directly from a Y-up XML.
+    """
+    origin = np.asarray(pose.position, dtype=np.float64)
+    target = np.asarray(pose.target(distance=1.0), dtype=np.float64)
+    up = pose.world_up()
+
+    if world_axis_transform is not None:
+        R = world_axis_transform[:3, :3]
+        t = world_axis_transform[:3, 3]
+        origin = R @ origin + t
+        target = R @ target + t
+        up = R @ up
+
     sensor_dict: dict[str, Any] = {
         "type": "perspective",
         "fov": float(np.rad2deg(intrinsics.fov_x_rad)),
         "fov_axis": "x",
         "to_world": mi.ScalarTransform4f.look_at(
-            origin=origin, target=target, up=up
+            origin=list(origin.tolist()),
+            target=list(target.tolist()),
+            up=list(up.tolist()),
         ),
         "film": {
             "type": "hdrfilm",
@@ -134,222 +152,31 @@ def render_beauty(
     spp: int,
     max_depth: int,
     seed: int = 0,
+    *,
+    pose_frame: Literal["mitsuba", "blender"] = "mitsuba",
 ) -> NDArray[np.float32]:
-    """Path-traced HDR RGB in linear radiance. Returns ``(H, W, 3)``."""
-    sensor = _build_sensor(pose, intrinsics, spp, sample_seed_offset=seed)
+    """Path-traced HDR RGB in linear radiance. Returns ``(H, W, 3)``.
+
+    ``pose_frame`` selects how ``pose`` should be interpreted:
+    ``"mitsuba"`` (the default) treats it as already living in the
+    Mitsuba scene's world frame; ``"blender"`` applies the inverse of the
+    mitsuba-blender addon's Y-up → Z-up rotation so a Z-up Blender pose
+    aligns with the loaded Y-up Mitsuba scene.
+    """
+    world_xf: NDArray[np.float64] | None = None
+    if pose_frame == "blender":
+        # Inverse of Y-up -> Z-up rotation.
+        world_xf = np.linalg.inv(_M_Y_UP_TO_Z_UP)
+    sensor = _build_sensor(
+        pose, intrinsics, spp, sample_seed_offset=seed,
+        world_axis_transform=world_xf,
+    )
     integrator = mi.load_dict({"type": "path", "max_depth": max_depth})
     img = mi.render(scene, sensor=sensor, integrator=integrator, spp=spp, seed=seed)
     arr = np.asarray(img, dtype=np.float32)
     if arr.shape[-1] >= 3:
         return arr[..., :3].copy()
     raise RuntimeError(f"Unexpected beauty image shape {arr.shape}")
-
-
-def render_aov(
-    scene: mi.Scene,
-    pose: CameraPose,
-    intrinsics: Intrinsics,
-    spp: int,
-    max_depth: int,
-    seed: int = 0,
-) -> AOVImages:
-    """Render depth, sh_normal, albedo, and shape_index AOVs."""
-    sensor = _build_sensor(pose, intrinsics, spp, sample_seed_offset=seed + 1)
-    integrator = mi.load_dict(
-        {
-            "type": "aov",
-            "aovs": _AOV_SPEC,
-            "integrator": {"type": "path", "max_depth": max_depth},
-        }
-    )
-    img = mi.render(scene, sensor=sensor, integrator=integrator, spp=spp, seed=seed + 1)
-    arr = np.asarray(img, dtype=np.float32)
-    if arr.ndim != 3 or arr.shape[-1] < _AOV_TOTAL_CHANNELS:
-        raise RuntimeError(
-            f"AOV image has unexpected shape {arr.shape}; "
-            f"expected (H, W, >= {_AOV_TOTAL_CHANNELS})"
-        )
-    depth = arr[..., _AOV_DEPTH][..., 0].copy()
-    # Mitsuba writes 0 for non-hit; convert to +inf for downstream sanity.
-    depth = np.where(depth > 0.0, depth, np.float32(np.inf))
-    normal = arr[..., _AOV_NORMAL].copy()
-    albedo = arr[..., _AOV_ALBEDO].copy()
-    shape_index = arr[..., _AOV_SHAPE][..., 0].astype(np.int32)
-    return AOVImages(
-        depth=depth, normal=normal, albedo=albedo, shape_index=shape_index
-    )
-
-
-def render_depth_for_filter(
-    scene: mi.Scene,
-    pose: CameraPose,
-    intrinsics: Intrinsics,
-    spp: int,
-    max_depth: int,
-    seed: int = 0,
-) -> NDArray[np.float32]:
-    """Fast low-resolution depth render for the camera-validity filter."""
-    sensor = _build_sensor(pose, intrinsics, spp, sample_seed_offset=seed + 2)
-    integrator = mi.load_dict(
-        {
-            "type": "aov",
-            "aovs": "depth:depth",
-            "integrator": {"type": "path", "max_depth": max_depth},
-        }
-    )
-    img = mi.render(scene, sensor=sensor, integrator=integrator, spp=spp, seed=seed + 2)
-    arr = np.asarray(img, dtype=np.float32)
-    # Layout: RGB (3) + depth (1) = 4 channels.
-    if arr.ndim != 3 or arr.shape[-1] < 4:
-        raise RuntimeError(f"Filter AOV image has unexpected shape {arr.shape}")
-    depth = arr[..., 3].copy()
-    depth = np.where(depth > 0.0, depth, np.float32(np.inf))
-    return depth
-
-
-# ---- Material LUT (per-shape roughness / metallic) ---------------------------
-
-_AOV_CAVEAT_MSG = (
-    "Per-shape roughness/metallic values are heuristic best-effort lookups based "
-    "on BSDF type strings (diffuse -> (1.0, 0.0), conductor -> (0.1, 1.0), "
-    "dielectric -> (0.0, 0.0), plastic -> (0.5, 0.0), principled -> reads "
-    "'roughness'/'metallic' params when present). Spatially-varying BSDF "
-    "parameters are NOT resolved per pixel. Untyped BSDFs default to (1.0, 0.0)."
-)
-
-
-def _bsdf_type_keyword(bsdf: object) -> str:
-    """Return a coarse type keyword inferred from the BSDF's repr."""
-    s = repr(bsdf).lower()
-    for key in (
-        "principled",
-        "roughconductor",
-        "roughdielectric",
-        "roughplastic",
-        "conductor",
-        "dielectric",
-        "plastic",
-        "diffuse",
-        "twosided",
-        "thindielectric",
-    ):
-        if key in s:
-            return key
-    return "other"
-
-
-def _scalar_param(params: object, key: str) -> float | None:
-    """Try to read a scalar param value from a SceneParameters-like object."""
-    try:
-        if key not in params:  # type: ignore[operator]
-            return None
-        v = params[key]  # type: ignore[index]
-    except Exception:
-        return None
-    try:
-        a = np.asarray(v, dtype=np.float64).reshape(-1)
-        if a.size == 0:
-            return None
-        return float(a.mean())
-    except Exception:
-        return None
-
-
-def derive_material_lut(scene: mi.Scene) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Build per-shape (roughness, metallic) arrays.
-
-    Returned arrays are 1D of length ``n_shapes + 1``. Index 0 is the "no hit"
-    sentinel (NaN values). Index ``i + 1`` corresponds to ``scene.shapes()[i]``,
-    matching the convention of Mitsuba's ``shape_index`` AOV.
-    """
-    shapes = scene.shapes()
-    n = len(shapes)
-    rough = np.full(n + 1, np.nan, dtype=np.float32)
-    metal = np.full(n + 1, np.nan, dtype=np.float32)
-
-    try:
-        params = mi.traverse(scene)
-    except Exception:
-        params = None
-
-    for i, shape in enumerate(shapes):
-        bsdf = shape.bsdf()
-        if bsdf is None:
-            continue
-        kw = _bsdf_type_keyword(bsdf)
-        r: float | None = None
-        m: float | None = None
-
-        # Default by BSDF family.
-        if kw == "diffuse" or kw == "twosided":
-            r, m = 1.0, 0.0
-        elif kw == "principled":
-            r, m = 0.5, 0.0
-        elif kw == "roughplastic":
-            r, m = 0.5, 0.0
-        elif kw == "plastic":
-            r, m = 0.3, 0.0
-        elif kw == "roughdielectric":
-            r, m = 0.1, 0.0
-        elif kw == "dielectric" or kw == "thindielectric":
-            r, m = 0.0, 0.0
-        elif kw == "roughconductor":
-            r, m = 0.1, 1.0
-        elif kw == "conductor":
-            r, m = 0.0, 1.0
-        else:
-            r, m = 1.0, 0.0
-
-        # Try to refine via parameter lookup.
-        if params is not None:
-            # SceneParameters keys look like "<shape_id>.bsdf.<param>".
-            sid = shape.id() if shape.id() else f"shape_{i}"
-            for k_metal in (
-                f"{sid}.bsdf.metallic",
-                f"{sid}.bsdf.brdf_0.metallic",
-            ):
-                v = _scalar_param(params, k_metal)
-                if v is not None:
-                    m = v
-                    break
-            for k_rough in (
-                f"{sid}.bsdf.roughness",
-                f"{sid}.bsdf.alpha",
-                f"{sid}.bsdf.brdf_0.roughness",
-                f"{sid}.bsdf.brdf_0.alpha",
-            ):
-                v = _scalar_param(params, k_rough)
-                if v is not None:
-                    r = v
-                    break
-
-        rough[i + 1] = float(r if r is not None else 1.0)
-        metal[i + 1] = float(m if m is not None else 0.0)
-
-    return rough, metal
-
-
-def materials_from_shape_index(
-    shape_index: NDArray[np.int32],
-    rough_lut: NDArray[np.float32],
-    metal_lut: NDArray[np.float32],
-) -> MaterialMaps:
-    """Broadcast a per-shape LUT to per-pixel material maps.
-
-    Pixels with no hit (``shape_index <= 0`` or out-of-range) receive NaN.
-    """
-    si = shape_index.astype(np.int32)
-    n_lut = rough_lut.shape[0]
-    out_rough = np.full(si.shape, np.nan, dtype=np.float32)
-    out_metal = np.full(si.shape, np.nan, dtype=np.float32)
-    mask = (si > 0) & (si < n_lut)
-    out_rough[mask] = rough_lut[si[mask]]
-    out_metal[mask] = metal_lut[si[mask]]
-    return MaterialMaps(roughness=out_rough, metallic=out_metal)
-
-
-def material_caveat_message() -> str:
-    return _AOV_CAVEAT_MSG
 
 
 def make_contact_sheet(

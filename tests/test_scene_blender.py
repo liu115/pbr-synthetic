@@ -37,7 +37,7 @@ def synthetic_box_xml(tmp_path_factory: pytest.TempPathFactory) -> Path:
     <ref id="WallsBSDF"/>
   </shape>
   <shape type="sphere" id="lamp">
-    <transform name="to_world"><translate x="0" y="1.0" z="0"/><scale value="0.15"/></transform>
+    <transform name="to_world"><translate x="0" y="0.5" z="0"/><scale value="0.1"/></transform>
     <ref id="LampBSDF"/>
     <emitter type="area"><rgb name="radiance" value="30, 30, 30"/></emitter>
   </shape>
