@@ -29,11 +29,22 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 
-# OpenCV (+Z forward, +Y up in pose_to_c2w's convention) -> Blender camera
-# convention (-Z forward, +Y up). Right-multiplying by this flips the camera's
-# Z basis without touching its X/Y, so the same world-space look direction is
-# preserved.
-_OPENCV_TO_BLENDER_CAM = np.diag([1.0, 1.0, -1.0, 1.0])
+# Convert a pose_to_c2w matrix (which mirrors Mitsuba's ScalarTransform4f.look_at:
+# col0 = cross(up, forward), col1 = cross(forward, col0), col2 = forward, +Y up,
+# +Z forward) to a Blender camera matrix_world.
+#
+# Two columns must flip:
+#   * Z column: Blender's camera looks down LOCAL -Z, while pose_to_c2w's Z is the
+#     forward direction; negating Z reverses the look axis so Blender's -Z lines
+#     up with the same world direction Mitsuba renders down +Z.
+#   * X column: Mitsuba's perspective sensor renders so that world +X appears on
+#     image-right even though pose_to_c2w's local +X = cross(up, forward) points
+#     to the camera's LEFT in world coordinates (this is an implicit x-flip
+#     inside Mitsuba's projection). Blender does not do this implicit flip — it
+#     treats col-0 literally as image-right. Without the additional X negation
+#     here the Blender image comes out HORIZONTALLY MIRRORED relative to
+#     Mitsuba, which is the regression --backend=both surfaced.
+_OPENCV_TO_BLENDER_CAM = np.diag([-1.0, 1.0, -1.0, 1.0])
 
 
 # ---- Camera placement -------------------------------------------------------
