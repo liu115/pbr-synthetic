@@ -14,9 +14,10 @@ include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not mitsuba_slow' --strict-markers -q"
+addopts = "-m 'not mitsuba_slow and not blender_slow' --strict-markers -q"
 markers = [
     "mitsuba_slow: tests that perform real Mitsuba renders (opt-in via -m mitsuba_slow)",
+    "blender_slow: tests that perform real Blender/Cycles renders (opt-in via -m blender_slow)",
 ]
 
 [tool.mypy]

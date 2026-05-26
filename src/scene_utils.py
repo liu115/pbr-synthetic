@@ -176,15 +176,19 @@ def inside_room_test(
     return result
 
 
-def derive_scene_info(
-    scene: mi.Scene,
+def scene_info_from_bbox(
+    bb_min: tuple[float, float, float],
+    bb_max: tuple[float, float, float],
     height_range: tuple[float, float] = (0.8, 1.8),
     placement_margin: float = 0.3,
     height_margin: float = 0.3,
     up_axis_override: UpAxis | None = None,
 ) -> SceneInfo:
-    """Compute the placement region and height range for camera sampling."""
-    bb_min, bb_max = compute_bbox(scene)
+    """Build a SceneInfo from an axis-aligned bbox + placement/height margins.
+
+    Renderer-agnostic helper: works from any source of (bb_min, bb_max) tuples
+    so the Mitsuba and Blender backends can share the same placement logic.
+    """
     up = up_axis_override if up_axis_override is not None else detect_up_axis(
         bb_min, bb_max
     )
@@ -214,4 +218,23 @@ def derive_scene_info(
         up_axis=up,
         placement_min=cast(tuple[float, float, float], tuple(pmin)),
         placement_max=cast(tuple[float, float, float], tuple(pmax)),
+    )
+
+
+def derive_scene_info(
+    scene: mi.Scene,
+    height_range: tuple[float, float] = (0.8, 1.8),
+    placement_margin: float = 0.3,
+    height_margin: float = 0.3,
+    up_axis_override: UpAxis | None = None,
+) -> SceneInfo:
+    """Compute the placement region and height range for camera sampling."""
+    bb_min, bb_max = compute_bbox(scene)
+    return scene_info_from_bbox(
+        bb_min=bb_min,
+        bb_max=bb_max,
+        height_range=height_range,
+        placement_margin=placement_margin,
+        height_margin=height_margin,
+        up_axis_override=up_axis_override,
     )

@@ -124,6 +124,98 @@ duplication. `metadata.mesh_export.per_shape[*].mode` records one of
 `tessellated_texture`, `tessellated_flat`, `fine_texture`, `fine_flat`, or
 `flat` (when `--no-tessellate`).
 
+## Blender backend (optional)
+
+A parallel Cycles-based entry point exists at `src/render_scene_blender.py`.
+It reads the same Mitsuba scene XML (via the official `mitsuba-blender`
+add-on), produces the same output schema (`transforms.json`, `metadata.json`,
+`rgb/`, `depth/`, `normal/`, `albedo/`, `roughness/`, `metallic/`,
+`scene.ply`), and is interchangeable with the Mitsuba pipeline downstream.
+`metadata.renderer` is `"blender"` for these runs (vs. `"mitsuba"` from the
+Mitsuba script). Useful when you want Cycles + OptiX denoising for clean
+images at low spp.
+
+Setup — **a separate conda env** is required because the `mitsuba-blender`
+add-on v0.4.0 was written for **Mitsuba 3.5** + **Blender 3.x** (pre-4.0):
+
+- Mitsuba 3.6+ removed `xml_to_props` and `ThreadEnvironment` and changed
+  the scene-parser data model.
+- Blender 4.0 rewrote the Principled BSDF and renamed input sockets
+  (`'Clearcoat'` → `'Coat Weight'`, `'Specular'` → `'Specular IOR Level'`,
+  etc.); the addon hardcodes pre-4.0 names in several BSDF code paths.
+- Blender 4.0 also removed `Mesh.calc_normals()` and `Mesh.create_normals_split()`,
+  renamed `bmesh.ops.create_uvsphere(diameter=…)` to `radius=…`, dropped the
+  `'SHARP'` Cycles distribution, and renamed the `'SOBOL_BURLEY'` sampling
+  pattern to `'TABULATED_SOBOL'`.
+
+The main `mitsuba` env stays at Mitsuba 3.8 for the Mitsuba pipeline; the
+Blender pipeline runs in a sister env pinned to Mitsuba 3.5 + bpy 4.2. An
+install script automates the env creation and applies all the addon
+compatibility patches at install time:
+
+```bash
+# One-shot: creates a fresh `pbr-capture-blender` env, installs deps,
+# downloads + patches the mitsuba-blender add-on. Idempotent.
+./install_blender_env.sh                       # default env name
+./install_blender_env.sh my-blender-env        # custom env name
+```
+
+What it installs:
+- Python 3.11 (bpy 4.2 LTS's required version)
+- bpy 4.2 LTS (Blender as a Python module)
+- mitsuba 3.5.2 (the addon's expected Mitsuba version)
+- numpy, imageio[freeimage], trimesh, pyyaml, pytest, mypy, viser
+- FreeImage binary (one-time download for EXR I/O)
+- mitsuba-blender add-on v0.4.0 from GitHub, extracted into Blender's
+  user-addons dir and patched in-place
+
+The addon-install step applies these idempotent compatibility patches:
+
+1. Renames the hyphenated `mitsuba-blender/` folder to `mitsuba_blender/`
+   so Python's import system can load it as a module.
+2. Rewrites `DEPS_MITSUBA_VERSION` to match the installed Mitsuba version.
+3. Wraps the `ThreadEnvironment` import in a try/except (Mitsuba 3.6+).
+4. Polyfills `xml_to_props` via `mitsuba.parser.parse_file` (Mitsuba 3.6+).
+5. Rewrites pre-4.0 Principled BSDF socket names (`Clearcoat`, `Specular`,
+   etc.) to their 4.0+ equivalents, plus float→color `Specular Tint`
+   fix-up and `'SHARP'` → `'BECKMANN'` for the Glass/Glossy BSDFs.
+6. Guards `Mesh.calc_normals()` with `hasattr` (removed in bpy 4.0).
+7. Renames `bmesh.ops.create_uvsphere(diameter=…)` → `radius=…`.
+8. Replaces the addon's bundled OBJ importer (`bl_import_obj.load`) with
+   Blender's built-in `bpy.ops.wm.obj_import` (3.4+; uses `create_normals_split`
+   which was removed in 4.0).
+9. Maps the `'SOBOL_BURLEY'` sampling pattern to `'TABULATED_SOBOL'`
+   (renamed in Cycles 4.2).
+
+Run:
+
+```bash
+conda activate pbr-capture-blender
+python -m src.render_scene_blender \
+    --scene /cluster_HDD/umoja/yliu/pbr-test/raw/bedroom/scene_v3.xml \
+    --output /cluster_HDD/umoja/yliu/pbr-test/rendered_blender/bedroom \
+    --num-cameras 200 \
+    --seed 42
+```
+
+Extra Blender-only flags:
+
+- `--cycles-device {OPTIX,CUDA,CPU}` — Cycles compute device. Default `OPTIX`.
+- `--denoiser {OPTIX,OPENIMAGEDENOISE,NONE}` — denoiser for beauty renders.
+  Default `OPTIX`.
+- `--install-addon-only` — short-circuit that installs and enables the
+  `mitsuba-blender` add-on from the latest GitHub release, then exits.
+
+Caveats:
+
+- BSDF mapping is approximate (`roughplastic` → Cycles Principled BSDF), so
+  beauty pixels won't match the Mitsuba pipeline byte-for-byte. Same seed →
+  same poses (camera sampling is renderer-free numpy), but rendered radiance
+  values differ.
+- `roughness` / `metallic` AOVs come from the object-index pass + a per-object
+  LUT read off each material's Principled BSDF input — same caveats as the
+  Mitsuba side (no spatially-varying lookup).
+
 ## Visualizer
 
 ```bash
@@ -157,11 +249,16 @@ conda run -n mitsuba mypy src                # strict type-check
 ```
 src/
   scene_utils.py        Mitsuba init, bbox, up-axis, raycasting, inside-room test
+  scene_blender.py      Blender flavor: addon install, scene load, bbox, raycast
   camera_sampling.py    Pose dataclass, orientation sampling, depth filter
-  render.py             Sensor build, beauty + AOV passes, material LUT
+  pose_utils.py         Renderer-free pose_to_c2w (numpy reimplementation)
+  render.py             Mitsuba sensor build, beauty + AOV passes, material LUT
+  render_blender.py     Cycles camera + render + AOV plumbing
   tonemap.py            Per-scene exposure derivation, gamma encode
   io_utils.py           Output layout, JSON schemas, EXR I/O, resume
-  render_scene.py       CLI entry point
+  mesh_utils.py         Tessellate-then-bake PLY exporter (renderer-free)
+  render_scene.py       CLI entry point (Mitsuba)
+  render_scene_blender.py  CLI entry point (Blender / Cycles)
   visualize.py          Viser viewer
 tests/
   test_*.py             Hermetic unit tests

@@ -105,7 +105,12 @@ def write_exr(path: Path, array: NDArray[Any]) -> None:
 
 
 def read_exr(path: Path) -> NDArray[np.float32]:
-    return np.asarray(imageio.imread(str(path)), dtype=np.float32)
+    # Force FreeImage EXR plugin; otherwise imageio's auto-pick can land on
+    # the wrong plugin (e.g. 'SPE') and raise spurious frame-count errors.
+    return np.asarray(
+        imageio.imread(str(path), format="EXR-FI"),  # type: ignore[arg-type]
+        dtype=np.float32,
+    )
 
 
 def write_png_uint8(path: Path, array: NDArray[np.uint8]) -> None:

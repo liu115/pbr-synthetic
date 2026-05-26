@@ -12,6 +12,21 @@ from numpy.typing import NDArray
 
 from src.camera_sampling import CameraPose
 from src.io_utils import Intrinsics
+from src.pose_utils import pose_to_c2w  # re-exported for backward compatibility
+
+__all__ = [
+    "AOVImages",
+    "MaterialMaps",
+    "RenderConfig",
+    "derive_material_lut",
+    "make_contact_sheet",
+    "material_caveat_message",
+    "materials_from_shape_index",
+    "pose_to_c2w",
+    "render_aov",
+    "render_beauty",
+    "render_depth_for_filter",
+]
 
 log = logging.getLogger(__name__)
 
@@ -97,15 +112,6 @@ def _build_sensor(
         },
     }
     return mi.load_dict(sensor_dict)
-
-
-def pose_to_c2w(pose: CameraPose) -> NDArray[np.float64]:
-    """Return the 4x4 camera-to-world matrix in OpenCV convention."""
-    origin = list(pose.position)
-    target = list(pose.target(distance=1.0))
-    up = pose.world_up().tolist()
-    T = mi.ScalarTransform4f.look_at(origin=origin, target=target, up=up)
-    return np.asarray(T.matrix, dtype=np.float64).reshape(4, 4)
 
 
 def render_beauty(
