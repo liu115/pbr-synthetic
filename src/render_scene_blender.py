@@ -143,6 +143,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Cycles denoiser for beauty renders (default OPTIX).")
     p.add_argument("--install-addon-only", action="store_true",
                    help="Install and enable the mitsuba-blender addon, then exit.")
+    p.add_argument("--roughplastic-coat-weight", type=float, default=0.8,
+                   help="Override the addon's hardcoded Coat Weight (default 0.8) "
+                        "for roughplastic/plastic BSDFs. Set 0.0 to disable the "
+                        "Cycles Coat layer, which brings rendered surfaces "
+                        "closer to Mitsuba's roughplastic (the upstream 0.8 "
+                        "default makes wood/plastic surfaces noticeably "
+                        "glossier than the same scene rendered with Mitsuba).")
     return p.parse_args(argv)
 
 
@@ -401,6 +408,7 @@ def _write_dataset_json(
             "denoiser": args.denoiser,
             "samples": rcfg.spp_beauty,
             "max_bounces": rcfg.max_depth,
+            "roughplastic_coat_weight": args.roughplastic_coat_weight,
         },
         "host": {
             "platform": platform.platform(),
@@ -478,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.install_addon_only:
-        module = ensure_mitsuba_addon()
+        module = ensure_mitsuba_addon(
+            roughplastic_coat_weight=args.roughplastic_coat_weight,
+        )
         log.info("mitsuba-blender addon ready (module=%s)", module)
         return 0
 
@@ -512,8 +522,9 @@ def main(argv: list[str] | None = None) -> int:
     rng = _set_seeds(args.seed)
     blender_version = init_blender(
         ensure_addon=True, device=args.cycles_device, denoiser=args.denoiser,
+        roughplastic_coat_weight=args.roughplastic_coat_weight,
     )
-    pass_index_to_object = load_scene_blender(args.scene)
+    pass_index_to_object, _pass_index_to_material = load_scene_blender(args.scene)
 
     info = derive_scene_info_blender(
         height_range=(args.height_min, args.height_max),

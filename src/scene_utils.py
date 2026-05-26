@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -15,6 +17,10 @@ log = logging.getLogger(__name__)
 
 UpAxis = Literal["x", "y", "z"]
 _AXIS_INDEX: dict[UpAxis, int] = {"x": 0, "y": 1, "z": 2}
+
+# Shape IDs that we treat as part of the room shell (used by floor-polygon
+# extraction). Matched case-insensitively as a substring of the shape ID.
+_ROOM_SHELL_PATTERN = re.compile(r"(wall|floor|ceiling|skirting)", re.IGNORECASE)
 
 
 @dataclass(slots=True, frozen=True)
@@ -238,3 +244,214 @@ def derive_scene_info(
         height_margin=height_margin,
         up_axis_override=up_axis_override,
     )
+
+
+# ---- 2D polygon helpers ------------------------------------------------------
+#
+# Used by the wall-walk camera sampler to test whether candidate camera
+# positions lie inside the room footprint, and by ``extract_floor_polygon`` to
+# fall back to a minimum-bounding-rectangle when named-wall geometry is not
+# available. All polygons here are in the horizontal plane: the up axis is
+# dropped and the remaining two axes are taken in their natural order
+# (x-up → polygon is (y, z), y-up → polygon is (x, z), z-up → polygon is (x, y)).
+
+
+def points_in_polygon(
+    points: NDArray[np.float64], polygon: NDArray[np.float64]
+) -> NDArray[np.bool_]:
+    """Vectorised ray-casting point-in-polygon test in the plane.
+
+    Args:
+        points: ``(M, 2)`` candidate points.
+        polygon: ``(N, 2)`` polygon vertices in any consistent winding. The
+            polygon is treated as closed (last vertex implicitly connects to
+            the first).
+
+    Returns:
+        ``(M,)`` boolean array. Points exactly on an edge are considered inside
+        with the usual odd-crossing convention.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    poly = np.asarray(polygon, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"points must be (M, 2); got {pts.shape}")
+    if poly.ndim != 2 or poly.shape[1] != 2 or poly.shape[0] < 3:
+        raise ValueError(f"polygon must be (N>=3, 2); got {poly.shape}")
+
+    x = pts[:, 0]
+    y = pts[:, 1]
+    inside = np.zeros(pts.shape[0], dtype=np.bool_)
+    n = poly.shape[0]
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        # Edges that straddle the horizontal line through the point.
+        cond = ((yi > y) != (yj > y))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_int = (xj - xi) * (y - yi) / (yj - yi) + xi
+        crosses = cond & (x < x_int)
+        inside ^= crosses
+        j = i
+    return inside
+
+
+def point_in_polygon(point: NDArray[np.float64], polygon: NDArray[np.float64]) -> bool:
+    """Scalar version of :func:`points_in_polygon` for a single point."""
+    return bool(points_in_polygon(np.asarray(point).reshape(1, 2), polygon)[0])
+
+
+def minimum_bounding_rectangle(points: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Smallest-area rectangle enclosing 2D ``points``.
+
+    Uses the rotating-calipers algorithm on the convex hull. Returns a ``(4, 2)``
+    array of corners in winding order (counter-clockwise starting from the
+    bottom-left of the rotated frame).
+    """
+    from scipy.spatial import ConvexHull
+
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2 or pts.shape[0] < 3:
+        raise ValueError(f"points must be (N>=3, 2); got {pts.shape}")
+
+    hull = ConvexHull(pts)
+    hull_pts = pts[hull.vertices]
+
+    edges = np.diff(np.vstack([hull_pts, hull_pts[:1]]), axis=0)
+    angles = np.arctan2(edges[:, 1], edges[:, 0])
+    # Each unique edge orientation produces a candidate rectangle. Restricting
+    # to [0, pi/2) is the standard rotating-calipers reduction.
+    angles = np.unique(np.mod(angles, np.pi / 2.0))
+
+    best_area = np.inf
+    best_corners = np.zeros((4, 2), dtype=np.float64)
+    for theta in angles:
+        c, s = np.cos(theta), np.sin(theta)
+        rot = np.array([[c, s], [-s, c]], dtype=np.float64)
+        rotated = hull_pts @ rot.T
+        x_min, y_min = rotated.min(axis=0)
+        x_max, y_max = rotated.max(axis=0)
+        area = (x_max - x_min) * (y_max - y_min)
+        if area < best_area:
+            best_area = area
+            corners_rot = np.array(
+                [
+                    [x_min, y_min],
+                    [x_max, y_min],
+                    [x_max, y_max],
+                    [x_min, y_max],
+                ],
+                dtype=np.float64,
+            )
+            best_corners = corners_rot @ rot
+    return best_corners
+
+
+# ---- Floor polygon extraction -----------------------------------------------
+
+
+def _horizontal_axes(up_axis: UpAxis) -> tuple[int, int]:
+    """Indices of the two non-up axes, in natural order."""
+    up_idx = _AXIS_INDEX[up_axis]
+    return cast(tuple[int, int], tuple(i for i in range(3) if i != up_idx))
+
+
+def _load_shape_vertices(scene_xml: Path, only_room_shell: bool) -> NDArray[np.float64]:
+    """Concatenate vertices from OBJ shapes referenced in ``scene_xml``.
+
+    Uses :func:`src.mesh_utils.parse_shape_bindings` to discover shapes (it
+    already handles ``<transform>`` matrices for us). When ``only_room_shell``
+    is True, restricts to shapes whose ID matches ``_ROOM_SHELL_PATTERN``;
+    returns an empty array if none match (the caller falls back to all shapes).
+    """
+    import trimesh  # noqa: F401  (imported for the cast type below)
+
+    from src.mesh_utils import parse_shape_bindings
+
+    bindings = parse_shape_bindings(scene_xml)
+    parts: list[NDArray[np.float64]] = []
+    for b in bindings:
+        if only_room_shell and not _ROOM_SHELL_PATTERN.search(b.shape_id or ""):
+            continue
+        if not b.obj_path.exists():
+            log.warning("Skipping missing OBJ %s for shape %s", b.obj_path, b.shape_id)
+            continue
+        try:
+            loaded = trimesh.load(b.obj_path, force="mesh", process=False)
+        except Exception as e:  # pragma: no cover - exercised via integration only
+            log.warning("Failed to load %s: %s", b.obj_path, e)
+            continue
+        # ``force="mesh"`` returns a Trimesh; the static return type is broader.
+        mesh = cast(trimesh.Trimesh, loaded)
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        if b.transform is not None:
+            t = np.asarray(b.transform, dtype=np.float64).reshape(4, 4)
+            verts_h = np.hstack([verts, np.ones((verts.shape[0], 1))])
+            verts = (verts_h @ t.T)[:, :3]
+        parts.append(verts)
+
+    if not parts:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.vstack(parts)
+
+
+def extract_floor_polygon(
+    scene_xml: Path, up_axis: UpAxis
+) -> NDArray[np.float64]:
+    """Return a 2D polygon (``(N, 2)``) approximating the room footprint.
+
+    Strategy:
+        1. If any shape in the XML has an ID containing wall/floor/ceiling/
+           skirting, use the convex hull of their floor-projected vertices.
+        2. Otherwise, fall back to the minimum bounding rectangle of all
+           geometry's floor projection (4 corners).
+
+    The 2D coordinates correspond to the two non-up axes in natural order.
+    """
+    from scipy.spatial import ConvexHull
+
+    shell_verts = _load_shape_vertices(scene_xml, only_room_shell=True)
+
+    horiz = _horizontal_axes(up_axis)
+    if shell_verts.shape[0] >= 3:
+        v2 = shell_verts[:, list(horiz)]
+        # Convex hull on the room-shell projection. Skirting/walls trace the
+        # room boundary tightly, so this beats a bounding rectangle.
+        try:
+            hull = ConvexHull(v2)
+            polygon = v2[hull.vertices]
+            log.info(
+                "extract_floor_polygon: convex hull of room-shell shapes "
+                "(%d points)", polygon.shape[0],
+            )
+            return cast(NDArray[np.float64], polygon.astype(np.float64, copy=False))
+        except Exception as e:
+            log.warning("ConvexHull failed on room shell (%s); falling back to MBR", e)
+
+    all_verts = _load_shape_vertices(scene_xml, only_room_shell=False)
+    if all_verts.shape[0] < 3:
+        raise RuntimeError(
+            f"Cannot extract floor polygon: no geometry loaded from {scene_xml}"
+        )
+    v2 = all_verts[:, list(horiz)]
+    polygon = minimum_bounding_rectangle(v2)
+    log.info("extract_floor_polygon: MBR fallback over all geometry")
+    return polygon
+
+
+def parse_scene_up_axis_from_xml(scene_xml: Path) -> UpAxis | None:
+    """Best-effort up-axis hint from the XML's ``<default name="up_axis">``.
+
+    Returns None if the scene XML doesn't declare one (most Bitterli scenes
+    don't — they assume Y up); callers should fall back to bbox heuristics.
+    """
+    try:
+        root = ET.parse(scene_xml).getroot()
+    except ET.ParseError:
+        return None
+    for d in root.findall("default"):
+        if d.get("name") in {"up_axis", "axis_up"}:
+            value = (d.get("value") or "").lower().strip("+-")
+            if value in {"x", "y", "z"}:
+                return cast(UpAxis, value)
+    return None

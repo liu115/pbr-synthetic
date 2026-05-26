@@ -25,17 +25,22 @@ def test_full_pipeline_on_synthetic_box(tmp_path: Path) -> None:
         """<?xml version="1.0"?>
 <scene version="3.0.0">
   <integrator type="path"><integer name="max_depth" value="4"/></integrator>
+  <bsdf type="twosided" id="WallsBSDF">
+    <bsdf type="diffuse">
+      <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
+    </bsdf>
+  </bsdf>
+  <bsdf type="diffuse" id="LampBSDF">
+    <rgb name="reflectance" value="0.9, 0.9, 0.9"/>
+  </bsdf>
   <shape type="cube" id="walls">
     <transform name="to_world"><scale x="2.0" y="1.2" z="2.0"/></transform>
     <boolean name="flip_normals" value="true"/>
-    <bsdf type="twosided">
-      <bsdf type="diffuse">
-        <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
-      </bsdf>
-    </bsdf>
+    <ref id="WallsBSDF"/>
   </shape>
   <shape type="sphere" id="lamp">
     <transform name="to_world"><translate x="0" y="1.0" z="0"/><scale value="0.15"/></transform>
+    <ref id="LampBSDF"/>
     <emitter type="area"><rgb name="radiance" value="30, 30, 30"/></emitter>
   </shape>
 </scene>

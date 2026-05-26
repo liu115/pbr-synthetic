@@ -55,12 +55,25 @@ class RenderConfig:
 
 @dataclass(slots=True, frozen=True)
 class AOVImages:
-    """Decoded AOV channels for one camera."""
+    """Decoded AOV channels for one camera.
+
+    The Mitsuba path populates only the first four (geometric) fields. The
+    Blender path populates everything, including per-pixel material maps. The
+    extra fields default to ``None`` so existing Mitsuba call-sites compile
+    unchanged; once the Mitsuba AOV path is removed (planned), these will all
+    become required.
+    """
 
     depth: NDArray[np.float32]
     normal: NDArray[np.float32]
-    albedo: NDArray[np.float32]
+    albedo: NDArray[np.float32]               # diffuse color (k_d)
     shape_index: NDArray[np.int32]
+    # New Blender-only fields (FIPT parity).
+    glossy_color: NDArray[np.float32] | None = None    # k_s (Cycles GlossCol pass)
+    emission: NDArray[np.float32] | None = None        # Cycles Emit pass
+    material_index: NDArray[np.int32] | None = None    # Cycles IndexMA pass
+    roughness_per_pixel: NDArray[np.float32] | None = None  # custom shader AOV
+    metallic_per_pixel: NDArray[np.float32] | None = None   # custom shader AOV
 
 
 @dataclass(slots=True, frozen=True)

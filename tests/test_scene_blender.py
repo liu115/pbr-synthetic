@@ -23,17 +23,22 @@ def synthetic_box_xml(tmp_path_factory: pytest.TempPathFactory) -> Path:
         """<?xml version="1.0"?>
 <scene version="3.0.0">
   <integrator type="path"><integer name="max_depth" value="4"/></integrator>
+  <bsdf type="twosided" id="WallsBSDF">
+    <bsdf type="diffuse">
+      <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
+    </bsdf>
+  </bsdf>
+  <bsdf type="diffuse" id="LampBSDF">
+    <rgb name="reflectance" value="0.9, 0.9, 0.9"/>
+  </bsdf>
   <shape type="cube" id="walls">
     <transform name="to_world"><scale x="2.0" y="1.2" z="2.0"/></transform>
     <boolean name="flip_normals" value="true"/>
-    <bsdf type="twosided">
-      <bsdf type="diffuse">
-        <rgb name="reflectance" value="0.7, 0.7, 0.7"/>
-      </bsdf>
-    </bsdf>
+    <ref id="WallsBSDF"/>
   </shape>
   <shape type="sphere" id="lamp">
     <transform name="to_world"><translate x="0" y="1.0" z="0"/><scale value="0.15"/></transform>
+    <ref id="LampBSDF"/>
     <emitter type="area"><rgb name="radiance" value="30, 30, 30"/></emitter>
   </shape>
 </scene>
@@ -52,8 +57,12 @@ def test_init_and_load(synthetic_box_xml: Path) -> None:
     )
 
     init_blender(ensure_addon=True, device="CPU", denoiser="NONE")
-    mapping = load_scene_blender(synthetic_box_xml)
-    assert mapping, "load_scene_blender returned an empty mapping"
+    obj_mapping, mat_mapping = load_scene_blender(synthetic_box_xml)
+    assert obj_mapping, "load_scene_blender returned an empty object mapping"
+    # Every material picked up by Cycles must have a unique pass_index.
+    pass_indices = [mat.pass_index for mat in mat_mapping.values()]
+    assert len(set(pass_indices)) == len(pass_indices)
+    assert all(idx >= 1 for idx in pass_indices)
 
     info = derive_scene_info_blender(
         height_range=(0.3, 1.0),

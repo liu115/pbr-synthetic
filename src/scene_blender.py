@@ -135,7 +135,9 @@ _XML_TO_PROPS_POLYFILL = (
 )
 
 
-def _patch_addon_for_compat(addon_dir: Path) -> None:
+def _patch_addon_for_compat(
+    addon_dir: Path, *, roughplastic_coat_weight: float = 0.8
+) -> None:
     """In-place patches to make mitsuba-blender v0.4.0 load against mitsuba 3.6+.
 
     Three changes (the upstream addon was written against mitsuba 3.5):
@@ -227,10 +229,47 @@ def _patch_addon_for_compat(addon_dir: Path) -> None:
             log.info("Patched xml_to_props polyfill into %s", importer_init_py)
 
     # ----- Patches 4-6: bpy 4.x compat (per upstream issue #113 + our own debugging).
-    _patch_addon_for_bpy4(addon_dir)
+    # Detect the running bpy version; the 4.x patches break things on bpy 3.x.
+    bpy = _import_bpy()
+    bpy_major = int(bpy.app.version[0])
+    if bpy_major >= 4:
+        _patch_addon_for_bpy4(addon_dir)
+
+    # ----- Patch: roughplastic Coat Weight (works on both 3.x and 4.x).
+    # The upstream addon hardcodes Coat Weight = 0.8 in write_mi_roughplastic_bsdf,
+    # which makes roughplastic surfaces noticeably brighter than Mitsuba renders.
+    # This patch lets callers tune the value (0.0 == Mitsuba-flavoured: no coat).
+    _patch_roughplastic_coat(
+        addon_dir / "io" / "importer" / "materials.py",
+        roughplastic_coat_weight,
+    )
 
     if n_ver == 0 and n_thr == 0:
         log.info("Top-level __init__.py compat patches already applied.")
+
+
+def _patch_roughplastic_coat(materials_py: Path, coat_weight: float) -> None:
+    """Override the addon's hardcoded `Coat Weight = 0.8` for roughplastic/plastic.
+
+    Runs after the bpy 4.x rename patch (if applicable), so on bpy 4.x the line
+    reads ``inputs['Coat Weight']`` and on bpy 3.x it still reads
+    ``inputs['Clearcoat']``. We rewrite both forms so the patch is bpy-agnostic.
+
+    Idempotent: replaces any literal ``= 0.8`` or ``= 0.0`` on the Coat line
+    with the requested value.
+    """
+    if not materials_py.exists():
+        return
+    src = materials_py.read_text()
+    target = f"{coat_weight:.4g}"
+    pattern = re.compile(
+        r"(bl_principled\.inputs\['(Coat Weight|Clearcoat)'\]\.default_value\s*=\s*)"
+        r"[0-9]+\.?[0-9]*"
+    )
+    new_src, n = pattern.subn(rf"\g<1>{target}", src)
+    if new_src != src:
+        materials_py.write_text(new_src)
+        log.info("Patched %d Coat Weight site(s) -> %s in materials.py", n, target)
 
 
 def _patch_addon_for_bpy4(addon_dir: Path) -> None:
@@ -346,7 +385,9 @@ def _patch_addon_for_bpy4(addon_dir: Path) -> None:
             log.info("Patched bpy 4.x sampling_pattern enum")
 
 
-def _install_addon_from_zip(bpy: Any, zip_path: Path) -> str:
+def _install_addon_from_zip(
+    bpy: Any, zip_path: Path, *, roughplastic_coat_weight: float = 0.8
+) -> str:
     """Extract the addon manually, normalize the folder name to a Python identifier.
 
     ``bpy.ops.preferences.addon_install`` keeps the zip's top-level folder name
@@ -379,12 +420,25 @@ def _install_addon_from_zip(bpy: Any, zip_path: Path) -> str:
             with z.open(member) as src, out_path.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
 
-    _patch_addon_for_compat(target_dir)
+    _patch_addon_for_compat(
+        target_dir, roughplastic_coat_weight=roughplastic_coat_weight
+    )
     return target_module
 
 
-def ensure_mitsuba_addon(*, force_reinstall: bool = False) -> str:
-    """Install + enable the mitsuba-blender addon. Returns the module name."""
+def ensure_mitsuba_addon(
+    *, force_reinstall: bool = False, roughplastic_coat_weight: float = 0.8
+) -> str:
+    """Install + enable the mitsuba-blender addon. Returns the module name.
+
+    Args:
+        force_reinstall: re-download + re-patch even if the addon is already enabled.
+        roughplastic_coat_weight: value written into the addon's hardcoded
+            ``Coat Weight`` slot for roughplastic/plastic BSDFs. The upstream
+            default is 0.8 which makes Cycles renders much glossier than the
+            equivalent Mitsuba render; set 0.0 to drop the coat layer and get
+            closer to Mitsuba's roughplastic appearance.
+    """
     bpy = _import_bpy()
     if not force_reinstall:
         existing = _addon_is_enabled(bpy)
@@ -395,7 +449,10 @@ def ensure_mitsuba_addon(*, force_reinstall: bool = False) -> str:
     if not ADDON_CACHE_PATH.exists() or force_reinstall:
         _download_addon_zip(ADDON_CACHE_PATH)
 
-    module_name = _install_addon_from_zip(bpy, ADDON_CACHE_PATH)
+    module_name = _install_addon_from_zip(
+        bpy, ADDON_CACHE_PATH,
+        roughplastic_coat_weight=roughplastic_coat_weight,
+    )
     # Tell Blender to rescan the scripts dir so the freshly-installed module
     # becomes visible to addon_enable.
     if hasattr(bpy.utils, "refresh_script_paths"):
@@ -458,11 +515,12 @@ def init_blender(
     ensure_addon: bool = True,
     device: str = "OPTIX",
     denoiser: str = "OPTIX",
+    roughplastic_coat_weight: float = 0.8,
 ) -> str:
     """Initialize Blender + Cycles for our pipeline. Returns the bpy version string."""
     bpy = _import_bpy()
     if ensure_addon:
-        ensure_mitsuba_addon()
+        ensure_mitsuba_addon(roughplastic_coat_weight=roughplastic_coat_weight)
     _configure_cycles(bpy, device=device, denoiser=denoiser)
     ver = ".".join(str(x) for x in bpy.app.version)
     log.info("Blender %s ready (engine=Cycles, device=%s, denoiser=%s)",
@@ -496,12 +554,19 @@ def _wipe_default_scene(bpy: Any) -> None:
                 continue
 
 
-def load_scene_blender(scene_xml: Path) -> dict[int, Any]:
+def load_scene_blender(
+    scene_xml: Path,
+) -> tuple[dict[int, Any], dict[int, Any]]:
     """Clear the current Blender scene and import a Mitsuba XML.
 
-    After import, every mesh object gets a unique ``pass_index`` (starting at
-    1 so 0 stays the "no hit" sentinel). Returns a mapping
-    ``pass_index -> bpy.types.Object`` for the LUT builder to walk.
+    Returns two mappings:
+
+    * ``pass_index_to_object``: per-object index used by the ``IndexOB`` pass.
+      Indices start at 1; 0 is the "no hit" sentinel.
+    * ``pass_index_to_material``: per-material index used by the ``IndexMA``
+      pass. Same indexing convention. Each Blender material gets a unique
+      ``pass_index`` so the per-pixel material segmentation is meaningful
+      (without this, every pixel in the ``IndexMA`` pass would be 0).
     """
     bpy = _import_bpy()
     _wipe_default_scene(bpy)
@@ -524,16 +589,29 @@ def load_scene_blender(scene_xml: Path) -> dict[int, Any]:
     # we don't want — we render with Cycles). Force Cycles back.
     bpy.context.scene.render.engine = "CYCLES"
 
-    mapping: dict[int, Any] = {}
+    obj_mapping: dict[int, Any] = {}
     next_idx = 1
     for obj in bpy.data.objects:
         if obj.type != "MESH":
             continue
         obj.pass_index = next_idx
-        mapping[next_idx] = obj
+        obj_mapping[next_idx] = obj
         next_idx += 1
-    log.info("Loaded %d mesh objects", len(mapping))
-    return mapping
+
+    mat_mapping: dict[int, Any] = {}
+    next_mat_idx = 1
+    for mat in bpy.data.materials:
+        if mat is None:
+            continue
+        mat.pass_index = next_mat_idx
+        mat_mapping[next_mat_idx] = mat
+        next_mat_idx += 1
+
+    log.info(
+        "Loaded %d mesh objects and %d materials",
+        len(obj_mapping), len(mat_mapping),
+    )
+    return obj_mapping, mat_mapping
 
 
 # Bbox + scene info -----------------------------------------------------------

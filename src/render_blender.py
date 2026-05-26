@@ -99,8 +99,18 @@ def _set_samples(bpy: Any, spp: int, max_depth: int, *, denoise: bool) -> None:
     vl.cycles.use_denoising = bool(denoise)
 
 
-def _set_passes(bpy: Any, *, beauty: bool, depth: bool, normal: bool,
-                albedo: bool, object_index: bool) -> None:
+def _set_passes(
+    bpy: Any,
+    *,
+    beauty: bool,
+    depth: bool,
+    normal: bool,
+    albedo: bool,
+    object_index: bool,
+    glossy_color: bool = False,
+    emission: bool = False,
+    material_index: bool = False,
+) -> None:
     vl = bpy.context.scene.view_layers[0]
     # Always keep the Combined pass on: Cycles 4.2 won't actually trace any
     # rays when use_pass_combined is False, which causes all derived passes
@@ -112,11 +122,96 @@ def _set_passes(bpy: Any, *, beauty: bool, depth: bool, normal: bool,
     vl.use_pass_combined = True
     vl.use_pass_z = bool(depth)
     vl.use_pass_normal = bool(normal)
-    # In Cycles 3.x+ the diffuse-color pass toggle lives on the view_layer
-    # itself, not on view_layer.cycles. (Some other cycles-only passes like
-    # shadow_catcher live on view_layer.cycles.)
     vl.use_pass_diffuse_color = bool(albedo)
     vl.use_pass_object_index = bool(object_index)
+    vl.use_pass_glossy_color = bool(glossy_color)
+    vl.use_pass_emit = bool(emission)
+    vl.use_pass_material_index = bool(material_index)
+
+
+# ---- Shader-level AOVs (per-pixel material parameters) ----------------------
+#
+# Cycles' built-in passes give us color-domain quantities (Diffuse Color,
+# Glossy Color, Emit) but not arbitrary BSDF inputs like roughness or
+# metallic. To capture those per-pixel, we wire a ShaderNodeOutputAOV into
+# every Principled-BSDF material, sourcing the value from the BSDF's
+# Roughness / Metallic socket. The view-layer must also declare an AOV slot
+# matching the output node's name. This mirrors FIPT's approach in
+# class_renderer_blender_mitsubaScene_3D.py.
+
+_SHADER_AOV_NAMES: tuple[str, ...] = ("PixelRoughness", "PixelMetallic")
+# Map the AOV name to the Principled-BSDF input it samples.
+_SHADER_AOV_INPUT: dict[str, str] = {
+    "PixelRoughness": "Roughness",
+    "PixelMetallic": "Metallic",
+}
+
+
+def _register_view_layer_aovs(bpy: Any) -> None:
+    """Ensure the view layer declares each shader AOV exactly once."""
+    vl = bpy.context.scene.view_layers[0]
+    existing = {a.name for a in vl.aovs}
+    for name in _SHADER_AOV_NAMES:
+        if name in existing:
+            continue
+        bpy.ops.scene.view_layer_add_aov()
+        vl.aovs[-1].name = name
+        vl.aovs[-1].type = "VALUE"
+
+
+def _wire_shader_aov_for_material(mat: Any, aov_name: str, input_name: str) -> None:
+    """Add a ShaderNodeOutputAOV to ``mat`` sourcing from a Principled input.
+
+    No-op if the material has no Principled BSDF, or if a same-named AOV
+    output already exists (so this function is idempotent across re-renders).
+    """
+    if mat is None or not getattr(mat, "use_nodes", False):
+        return
+    tree = mat.node_tree
+    if tree is None:
+        return
+
+    for n in tree.nodes:
+        if n.bl_idname == "ShaderNodeOutputAOV" and getattr(n, "name", "") == aov_name:
+            return  # already wired
+
+    principled = None
+    for n in tree.nodes:
+        if n.bl_idname == "ShaderNodeBsdfPrincipled":
+            principled = n
+            break
+    if principled is None:
+        return
+
+    socket = principled.inputs.get(input_name)
+    if socket is None:
+        return
+
+    aov_node = tree.nodes.new("ShaderNodeOutputAOV")
+    aov_node.name = aov_name
+
+    if socket.is_linked:
+        src_socket = socket.links[0].from_socket
+    else:
+        # Materialise the default scalar value into a Value node so it can
+        # drive the AOV output (sockets without links can't be wired directly).
+        val = tree.nodes.new("ShaderNodeValue")
+        val.outputs[0].default_value = float(socket.default_value)
+        src_socket = val.outputs[0]
+    tree.links.new(src_socket, aov_node.inputs["Value"])
+
+
+def setup_shader_aovs(bpy: Any) -> None:
+    """Register shader AOVs at the view-layer level and wire them per material.
+
+    Idempotent: safe to call before every render even though the per-frame
+    cost is tiny. Materials added later (e.g. by re-importing the scene) are
+    picked up automatically on the next call.
+    """
+    _register_view_layer_aovs(bpy)
+    for mat in bpy.data.materials:
+        for aov_name in _SHADER_AOV_NAMES:
+            _wire_shader_aov_for_material(mat, aov_name, _SHADER_AOV_INPUT[aov_name])
 
 
 # ---- Compositor setup -------------------------------------------------------
@@ -161,6 +256,10 @@ def _setup_compositor_for_aov(
     bpy: Any, out_dir: Path, *,
     write_beauty: bool, write_depth: bool, write_normal: bool,
     write_albedo: bool, write_object_index: bool,
+    write_glossy_color: bool = False, write_emission: bool = False,
+    write_material_index: bool = False,
+    write_shader_aov_roughness: bool = False,
+    write_shader_aov_metallic: bool = False,
 ) -> dict[str, Path]:
     """Build a compositor pipeline writing each enabled pass to its own EXR.
 
@@ -227,6 +326,17 @@ def _setup_compositor_for_aov(
         add("albedo", "DiffCol", "albedo_")
     if write_object_index:
         add("object_index", "IndexOB", "objidx_", broadcast=True)
+    if write_glossy_color:
+        add("glossy_color", "GlossCol", "gloss_")
+    if write_emission:
+        add("emission", "Emit", "emit_")
+    if write_material_index:
+        add("material_index", "IndexMA", "matidx_", broadcast=True)
+    if write_shader_aov_roughness:
+        # Shader AOVs appear on the RLayers node under their declared name.
+        add("shader_roughness", "PixelRoughness", "rough_", broadcast=True)
+    if write_shader_aov_metallic:
+        add("shader_metallic", "PixelMetallic", "metal_", broadcast=True)
 
     bpy.context.scene.frame_current = 1
     return paths
@@ -301,6 +411,13 @@ def render_beauty_blender(
     raise RuntimeError(f"Unexpected beauty image shape {img.shape}")
 
 
+def _to_value_channel(arr: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Collapse the broadcast-RGB EXR back to a single channel."""
+    if arr.ndim == 3:
+        return np.ascontiguousarray(arr[..., 0], dtype=np.float32)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
 def render_aov_blender(
     pose: CameraPose,
     intrinsics: Intrinsics,
@@ -308,41 +425,73 @@ def render_aov_blender(
     max_depth: int,
     seed: int = 0,
 ) -> AOVImages:
-    """Render depth, normal (world space), albedo, and object-index passes."""
+    """Render the full AOV stack for one camera.
+
+    Returns an :class:`AOVImages` populated with depth, world-space normal,
+    diffuse color (k_d), object-index segmentation, and (Blender-only)
+    glossy color, emission, material-index segmentation, and per-pixel
+    roughness + metallic via shader AOVs.
+    """
     bpy = _import_bpy()
     set_camera(pose, intrinsics)
     _set_resolution(bpy, intrinsics.width, intrinsics.height)
     # AOVs don't need denoising — they're per-pixel deterministic geometry.
     _set_samples(bpy, spp=spp, max_depth=max_depth, denoise=False)
-    _set_passes(bpy, beauty=False, depth=True, normal=True,
-                albedo=True, object_index=True)
+    _set_passes(
+        bpy,
+        beauty=False,
+        depth=True, normal=True, albedo=True, object_index=True,
+        glossy_color=True, emission=True, material_index=True,
+    )
+    setup_shader_aovs(bpy)
+
     with tempfile.TemporaryDirectory(prefix="pbr_blender_aov_") as td:
         paths = _setup_compositor_for_aov(
             bpy, Path(td),
             write_beauty=False, write_depth=True, write_normal=True,
             write_albedo=True, write_object_index=True,
+            write_glossy_color=True, write_emission=True,
+            write_material_index=True,
+            write_shader_aov_roughness=True, write_shader_aov_metallic=True,
         )
         _render_now(bpy, seed=seed + 1)
-        z = _read_exr(paths["depth"])
-        if z.ndim == 3:
-            z = z[..., 0]
+        z = _to_value_channel(_read_exr(paths["depth"]))
         normal = _read_exr(paths["normal"])
         albedo = _read_exr(paths["albedo"])
-        obj_idx = _read_exr(paths["object_index"])
-        if obj_idx.ndim == 3:
-            obj_idx = obj_idx[..., 0]
+        obj_idx = _to_value_channel(_read_exr(paths["object_index"]))
+        gloss = _read_exr(paths["glossy_color"])
+        emit = _read_exr(paths["emission"])
+        mat_idx = _to_value_channel(_read_exr(paths["material_index"]))
+        rough_px = _to_value_channel(_read_exr(paths["shader_roughness"]))
+        metal_px = _to_value_channel(_read_exr(paths["shader_metallic"]))
 
-    depth_t = _ray_t_from_z(z.astype(np.float32), intrinsics)
+    depth_t = _ray_t_from_z(z, intrinsics)
     if normal.ndim != 3 or normal.shape[-1] < 3:
         raise RuntimeError(f"Unexpected normal shape {normal.shape}")
     normal = np.ascontiguousarray(normal[..., :3], dtype=np.float32)
     if albedo.ndim != 3 or albedo.shape[-1] < 3:
         raise RuntimeError(f"Unexpected albedo shape {albedo.shape}")
     albedo = np.ascontiguousarray(albedo[..., :3], dtype=np.float32)
+    if gloss.ndim != 3 or gloss.shape[-1] < 3:
+        raise RuntimeError(f"Unexpected glossy-color shape {gloss.shape}")
+    gloss = np.ascontiguousarray(gloss[..., :3], dtype=np.float32)
+    if emit.ndim != 3 or emit.shape[-1] < 3:
+        raise RuntimeError(f"Unexpected emission shape {emit.shape}")
+    emit = np.ascontiguousarray(emit[..., :3], dtype=np.float32)
+
     shape_index = np.rint(obj_idx).astype(np.int32)
+    material_index = np.rint(mat_idx).astype(np.int32)
 
     return AOVImages(
-        depth=depth_t, normal=normal, albedo=albedo, shape_index=shape_index,
+        depth=depth_t,
+        normal=normal,
+        albedo=albedo,
+        shape_index=shape_index,
+        glossy_color=gloss,
+        emission=emit,
+        material_index=material_index,
+        roughness_per_pixel=rough_px,
+        metallic_per_pixel=metal_px,
     )
 
 

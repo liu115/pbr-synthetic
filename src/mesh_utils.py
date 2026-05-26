@@ -176,6 +176,7 @@ class ShapeBinding:
     obj_path: Path
     bsdf_id: str | None
     transform: NDArray[np.float64] | None  # 4x4, or None if identity
+    shape_id: str | None = None            # value of <shape id="...">, if any
 
 
 def _parse_transform(elem: ET.Element) -> NDArray[np.float64] | None:
@@ -226,6 +227,7 @@ def parse_shape_bindings(xml_path: Path) -> list[ShapeBinding]:
                 obj_path=(xml_dir / filename).resolve(),
                 bsdf_id=bsdf_id,
                 transform=transform,
+                shape_id=shape.get("id"),
             )
         )
     return bindings
