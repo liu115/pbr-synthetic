@@ -7,7 +7,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Callable, Literal, cast
 
 import mitsuba as mi
 import numpy as np
@@ -423,6 +423,49 @@ def _load_shape_vertices(scene_xml: Path, only_room_shell: bool) -> NDArray[np.f
     return np.vstack(parts)
 
 
+def floor_polygon_from_verts(
+    shell_verts: NDArray[np.float64],
+    fallback_verts_fn: Callable[[], NDArray[np.float64]],
+    up_axis: UpAxis,
+) -> NDArray[np.float64]:
+    """Build a 2D floor polygon (``(N, 2)``) from 3D vertex sets.
+
+    First tries the convex hull of ``shell_verts`` (presumed to be the
+    wall/floor/ceiling/skirting projection). On failure (too few vertices or
+    degenerate hull), calls ``fallback_verts_fn()`` and returns the minimum
+    bounding rectangle of the result. The 2D coordinates correspond to the
+    two non-up axes in natural order.
+
+    ``fallback_verts_fn`` is a thunk so the (potentially expensive) full-mesh
+    gather only happens when the shell-hull path fails.
+    """
+    from scipy.spatial import ConvexHull
+
+    horiz = _horizontal_axes(up_axis)
+    if shell_verts.shape[0] >= 3:
+        v2 = shell_verts[:, list(horiz)]
+        try:
+            hull = ConvexHull(v2)
+            polygon = v2[hull.vertices]
+            log.info(
+                "floor_polygon_from_verts: convex hull of room shell (%d points)",
+                polygon.shape[0],
+            )
+            return cast(NDArray[np.float64], polygon.astype(np.float64, copy=False))
+        except Exception as e:
+            log.warning("ConvexHull failed on room shell (%s); falling back to MBR", e)
+
+    all_verts = fallback_verts_fn()
+    if all_verts.shape[0] < 3:
+        raise RuntimeError(
+            "Cannot extract floor polygon: no fallback geometry available."
+        )
+    v2 = all_verts[:, list(horiz)]
+    polygon = minimum_bounding_rectangle(v2)
+    log.info("floor_polygon_from_verts: MBR fallback over all geometry")
+    return polygon
+
+
 def extract_floor_polygon(
     scene_xml: Path, up_axis: UpAxis
 ) -> NDArray[np.float64]:
@@ -436,35 +479,12 @@ def extract_floor_polygon(
 
     The 2D coordinates correspond to the two non-up axes in natural order.
     """
-    from scipy.spatial import ConvexHull
-
     shell_verts = _load_shape_vertices(scene_xml, only_room_shell=True)
-
-    horiz = _horizontal_axes(up_axis)
-    if shell_verts.shape[0] >= 3:
-        v2 = shell_verts[:, list(horiz)]
-        # Convex hull on the room-shell projection. Skirting/walls trace the
-        # room boundary tightly, so this beats a bounding rectangle.
-        try:
-            hull = ConvexHull(v2)
-            polygon = v2[hull.vertices]
-            log.info(
-                "extract_floor_polygon: convex hull of room-shell shapes "
-                "(%d points)", polygon.shape[0],
-            )
-            return cast(NDArray[np.float64], polygon.astype(np.float64, copy=False))
-        except Exception as e:
-            log.warning("ConvexHull failed on room shell (%s); falling back to MBR", e)
-
-    all_verts = _load_shape_vertices(scene_xml, only_room_shell=False)
-    if all_verts.shape[0] < 3:
-        raise RuntimeError(
-            f"Cannot extract floor polygon: no geometry loaded from {scene_xml}"
-        )
-    v2 = all_verts[:, list(horiz)]
-    polygon = minimum_bounding_rectangle(v2)
-    log.info("extract_floor_polygon: MBR fallback over all geometry")
-    return polygon
+    return floor_polygon_from_verts(
+        shell_verts,
+        lambda: _load_shape_vertices(scene_xml, only_room_shell=False),
+        up_axis,
+    )
 
 
 def parse_scene_up_axis_from_xml(scene_xml: Path) -> UpAxis | None:

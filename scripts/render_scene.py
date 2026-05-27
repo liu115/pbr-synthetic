@@ -79,6 +79,7 @@ from src.render_blender import (
 )
 from src.scene_blender import (
     derive_scene_info_blender,
+    extract_floor_polygon_blender,
     init_blender,
     inside_room_test_blender,
     load_scene_blender,
@@ -86,7 +87,6 @@ from src.scene_blender import (
 from src.scene_utils import (
     SceneInfo,
     UpAxis,
-    extract_floor_polygon,
     init_mitsuba,
     load_scene,
     parse_scene_up_axis_from_xml,
@@ -114,7 +114,7 @@ DEFAULT_FULL_W, DEFAULT_FULL_H = 640, 480
 DEFAULT_DEBUG_W, DEFAULT_DEBUG_H = 160, 120
 DEFAULT_FILTER_W, DEFAULT_FILTER_H = 160, 90
 
-DEFAULT_SPP_MITSUBA_FULL = 2048
+DEFAULT_SPP_MITSUBA_FULL = 4096
 DEFAULT_SPP_MITSUBA_DEBUG = 64
 DEFAULT_SPP_BLENDER_FULL = 256       # Cycles + denoising converges much faster
 DEFAULT_SPP_BLENDER_DEBUG = 32
@@ -310,7 +310,6 @@ def _sample_phase(
     rng: np.random.Generator,
     rcfg: RenderConfig,
     args: argparse.Namespace,
-    scene_xml_for_polygon: Path,
 ) -> tuple[list[CameraPose], dict[str, Any]]:
     filter_intr = compute_intrinsics(args.fov, rcfg.filter_width, rcfg.filter_height)
 
@@ -333,7 +332,7 @@ def _sample_phase(
 
     floor_polygon: NDArray[np.float64] | None = None
     if args.sampler == "wall_walk":
-        floor_polygon = extract_floor_polygon(scene_xml_for_polygon, info.up_axis)
+        floor_polygon = extract_floor_polygon_blender(info.up_axis)
 
     sampler = make_sampler(
         args.sampler,
@@ -777,9 +776,7 @@ def main(argv: list[str] | None = None) -> int:
         (rcfg.beauty_intrinsics.width, rcfg.beauty_intrinsics.height),
         rcfg.spp_aov, rcfg.max_depth, rcfg.debug, backends,
     )
-    poses, sampling_meta = _sample_phase(
-        info, rng, rcfg, args, scene_for_load
-    )
+    poses, sampling_meta = _sample_phase(info, rng, rcfg, args)
     if not poses:
         log.error("No cameras passed filtering; aborting before render.")
         return 1

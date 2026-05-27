@@ -21,7 +21,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
-from src.scene_utils import SceneInfo, UpAxis, _AXIS_INDEX, scene_info_from_bbox
+from src.scene_utils import (
+    SceneInfo,
+    UpAxis,
+    _AXIS_INDEX,
+    _ROOM_SHELL_PATTERN,
+    floor_polygon_from_verts,
+    scene_info_from_bbox,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only
     import bpy  # noqa: F401
@@ -653,6 +660,53 @@ def compute_bbox_blender() -> tuple[
     if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
         raise RuntimeError("No mesh objects in the Blender scene; bbox undefined.")
     return (float(lo[0]), float(lo[1]), float(lo[2])), (float(hi[0]), float(hi[1]), float(hi[2]))
+
+
+def _gather_world_verts_blender() -> tuple[
+    NDArray[np.float64], NDArray[np.float64]
+]:
+    """Single pass over Blender meshes returning (shell_verts, all_verts).
+
+    Vertices are transformed into world space (Blender's Z-up frame after
+    the mitsuba-blender Y->Z import rotation). Objects whose name matches
+    :data:`src.scene_utils._ROOM_SHELL_PATTERN` go into the shell set.
+    """
+    bpy = _import_bpy()
+    shell_parts: list[NDArray[np.float64]] = []
+    all_parts: list[NDArray[np.float64]] = []
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        mesh = obj.data
+        n = len(mesh.vertices)
+        if n == 0:
+            continue
+        coords = np.empty(n * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", coords)
+        local = coords.reshape(n, 3)
+        mw = np.asarray(obj.matrix_world, dtype=np.float64)
+        homog = np.concatenate([local, np.ones((n, 1), dtype=np.float64)], axis=1)
+        world = (mw @ homog.T).T[:, :3]
+        all_parts.append(world)
+        if _ROOM_SHELL_PATTERN.search(obj.name):
+            shell_parts.append(world)
+    empty = np.zeros((0, 3), dtype=np.float64)
+    shell_verts = np.vstack(shell_parts) if shell_parts else empty
+    all_verts = np.vstack(all_parts) if all_parts else empty
+    return shell_verts, all_verts
+
+
+def extract_floor_polygon_blender(up_axis: UpAxis) -> NDArray[np.float64]:
+    """Floor polygon ``(N, 2)`` in Blender world-space coordinates.
+
+    Mirrors :func:`src.scene_utils.extract_floor_polygon` but reads geometry
+    from the loaded Blender scene, so the polygon lives in the same Z-up
+    frame as :func:`compute_bbox_blender` / :func:`inside_room_test_blender`
+    / :func:`derive_scene_info_blender`. The 2D coordinates correspond to
+    the two non-up axes in natural order.
+    """
+    shell_verts, all_verts = _gather_world_verts_blender()
+    return floor_polygon_from_verts(shell_verts, lambda: all_verts, up_axis)
 
 
 def derive_scene_info_blender(

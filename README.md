@@ -39,9 +39,6 @@ Useful flags (see `--help` for the rest):
 - `--cycles-device {OPTIX,CUDA,CPU}` / `--denoiser {OPTIX,OPENIMAGEDENOISE,NONE}`
 - `--envmap-patch-size N` — spatial-grid spacing for per-pixel envmaps.
 
-See `docs/operational.md` for `scene_config.yaml`, resume behavior, and
-`--only-ply`.
-
 ## Output schema
 
 ```
