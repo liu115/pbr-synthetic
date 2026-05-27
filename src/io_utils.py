@@ -194,6 +194,8 @@ def write_transforms_json(
 ) -> None:
     payload: dict[str, Any] = {
         "coordinate_convention": "opencv",
+        "world_up_axis": up_axis,
+        "depth_format": "z_depth_meters",
         "up_axis": up_axis,
         "camera_angle_x": intrinsics.fov_x_rad,
         "fl_x": intrinsics.fl_x,

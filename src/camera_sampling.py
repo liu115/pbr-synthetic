@@ -133,7 +133,12 @@ class FilterStats:
 def depth_validity(
     depth: NDArray[np.float64], cfg: DepthFilterConfig
 ) -> DepthFilterResult:
-    """Inspect a depth array and decide whether the camera is acceptable."""
+    """Inspect a depth array and decide whether the camera is acceptable.
+
+    ``depth`` is the perspective z-depth in meters (camera-space +Z), the same
+    format written to ``depth/*.exr``. ``+inf`` / non-positive values mark
+    pixels with no surface hit.
+    """
     if depth.size == 0:
         raise ValueError("Empty depth array")
 

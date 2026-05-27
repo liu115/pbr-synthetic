@@ -20,7 +20,7 @@ from src.envmap_render import (
     _world_matrix_for_envmap,
 )
 from src.io_utils import Intrinsics, compute_intrinsics
-from src.pose_utils import pose_to_c2w
+from src.pose_utils import pose_to_c2w_opencv
 
 
 # ---- Unit tests (no Blender) ------------------------------------------------
@@ -48,19 +48,21 @@ def test_local_frame_from_normal_has_normal_as_y_column() -> None:
     np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-9)
 
 
-def test_local_frame_handles_normal_parallel_to_world_up() -> None:
-    """Edge case: normal == world_up means the natural 'right' vector is degenerate."""
-    R = _local_frame_from_normal(np.array([0.0, 1.0, 0.0]))
+def test_local_frame_handles_normal_parallel_to_z_up() -> None:
+    """Edge case: normal == world Z-up triggers the fallback reference axis."""
+    R = _local_frame_from_normal(np.array([0.0, 0.0, 1.0]))
     assert np.isfinite(R).all()
     np.testing.assert_allclose(R.T @ R, np.eye(3), atol=1e-9)
+    # Column 1 (the "up" of the local frame) is still the normal.
+    np.testing.assert_allclose(R[:, 1], np.array([0.0, 0.0, 1.0]), atol=1e-9)
 
 
-def test_local_frame_for_floor_normal() -> None:
-    """A floor (normal = world_up) and a wall (normal = world_x) both produce valid frames."""
+def test_local_frame_for_floor_and_wall_normals() -> None:
+    """Floor (normal = +Z) and wall (normal = ±X / ±Y) both produce valid frames."""
     for n_world in (
-        np.array([0.0, 1.0, 0.0]),
-        np.array([1.0, 0.0, 0.0]),
-        np.array([0.0, 0.0, 1.0]),
+        np.array([0.0, 0.0, 1.0]),     # floor (Z-up world)
+        np.array([1.0, 0.0, 0.0]),     # wall
+        np.array([0.0, 1.0, 0.0]),     # wall
         np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0),
     ):
         R = _local_frame_from_normal(n_world)
@@ -77,16 +79,14 @@ def test_world_matrix_offsets_along_normal() -> None:
 
 
 def test_backproject_at_principal_point_recovers_camera_forward() -> None:
-    """A pixel at (cx, cy) with depth t should land t meters in front of the camera."""
+    """A pixel at (cx, cy) with z-depth z should land z meters in front of the camera."""
     intr = compute_intrinsics(fov_x_deg=60.0, width=640, height=480)
     pose = CameraPose(position=(0.0, 1.0, 0.0), yaw=0.0, pitch=0.0, up_axis="y")
-    c2w = pose_to_c2w(pose).astype(np.float64)
+    c2w = pose_to_c2w_opencv(pose).astype(np.float64)
     pt = _backproject_pixel(
         px=float(intr.cx), py=float(intr.cy),
-        depth_t=2.0, intrinsics=intr, c2w=c2w,
+        depth_z=2.0, intrinsics=intr, c2w=c2w,
     )
-    # OpenCV convention with yaw=0/pitch=0: +Z forward of the camera maps to
-    # world -Z (so the camera looks down -Z in world space).
     expected = np.array(pose.position) + 2.0 * pose.forward()
     np.testing.assert_allclose(pt, expected, atol=1e-6)
 
@@ -94,14 +94,18 @@ def test_backproject_at_principal_point_recovers_camera_forward() -> None:
 def test_backproject_off_axis_pixel_lies_at_correct_distance() -> None:
     intr = compute_intrinsics(fov_x_deg=60.0, width=640, height=480)
     pose = CameraPose(position=(0.5, 1.0, -0.5), yaw=0.3, pitch=-0.1, up_axis="y")
-    c2w = pose_to_c2w(pose).astype(np.float64)
+    c2w = pose_to_c2w_opencv(pose).astype(np.float64)
+    px, py, z = 100.0, 200.0, 3.5
     pt = _backproject_pixel(
-        px=100.0, py=200.0, depth_t=3.5, intrinsics=intr, c2w=c2w,
+        px=px, py=py, depth_z=z, intrinsics=intr, c2w=c2w,
     )
-    # By the ray-t convention, the world distance from the camera origin
-    # equals depth_t for a back-projected pixel.
+    # With z-depth, the world distance is z * sqrt(1 + u^2 + v^2), where
+    # (u, v) = ((px - cx)/fx, (py - cy)/fy).
+    u = (px - intr.cx) / intr.fl_x
+    v = (py - intr.cy) / intr.fl_y
+    expected_dist = z * float(np.sqrt(1.0 + u * u + v * v))
     dist = float(np.linalg.norm(pt - np.array(pose.position)))
-    assert dist == pytest.approx(3.5, abs=1e-6)
+    assert dist == pytest.approx(expected_dist, abs=1e-6)
 
 
 # ---- Slow integration test --------------------------------------------------

@@ -62,7 +62,7 @@ from src.io_utils import (
     write_transforms_json,
 )
 from src.mesh_utils import export_colored_mesh_ply
-from src.pose_utils import pose_to_c2w
+from src.pose_utils import pose_to_c2w_opencv
 from src.render import (
     RenderConfig,
     make_contact_sheet,
@@ -568,7 +568,7 @@ def _write_dataset_json(
     beauty_intr = rcfg.beauty_intrinsics
     frames = [
         build_frame_record(
-            i, pose_to_c2w(pose),
+            i, pose_to_c2w_opencv(pose),
             backends=backends, with_envmap=with_envmap,
         )
         for i, pose in enumerate(poses)
@@ -643,8 +643,9 @@ def _write_dataset_json(
             "metallic": "per-pixel shader AOV (Principled BSDF Metallic)",
         },
         "depth_convention": (
-            "Per-pixel value is the ray-distance t (in meters) from the camera "
-            "origin to the first surface hit. NOT perspective Z-depth."
+            "Per-pixel value is the perspective z-depth (camera-space +Z, in "
+            "meters) from the camera plane to the first surface hit. Multiply "
+            "by sqrt(1 + ((u-cx)/fx)^2 + ((v-cy)/fy)^2) to convert to ray-t."
         ),
     }
     metadata.update(extra_metadata)

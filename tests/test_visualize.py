@@ -494,16 +494,16 @@ def test_export_colored_mesh_ply_tessellated_bakes_texture(tmp_path: Path) -> No
     verts = np.asarray(loaded.vertices)
     vc = np.asarray(loaded.visual.vertex_colors)
     # Vertices in the "low v" half (UV v < 0.5) sampled blue in image; v-flip
-    # means image row near bottom (= blue).
-    # The actual UV at each vertex is bary-interp of (0,0), (1,0), (0,1) by
-    # (i/N, j/N, k/N); UV v = i/N (since only uv2's v is 1). So vertices with
-    # large y (close to v=1 corner) sample red, small y sample blue.
-    big_y = verts[:, 1] > 0.7
-    small_y = verts[:, 1] < 0.3
+    # means image row near bottom (= blue). UV v at each vertex equals the
+    # original Y coordinate of the triangle vertices (0,0,0), (1,0,0), (0,1,0).
+    # The PLY export rotates Mitsuba Y-up to Z-up (Y -> Z), so vertices with
+    # large saved-Z (close to v=1 corner) sample red, small saved-Z sample blue.
+    big_v = verts[:, 2] > 0.7
+    small_v = verts[:, 2] < 0.3
     # In the red region: R should dominate B (and vice versa). Some interpolation
     # near the half-line is unavoidable so we only assert the extreme regions.
-    assert (vc[big_y, 0] > vc[big_y, 2]).all(), "verts near v=1 should sample red"
-    assert (vc[small_y, 2] > vc[small_y, 0]).all(), "verts near v=0 should sample blue"
+    assert (vc[big_v, 0] > vc[big_v, 2]).all(), "verts near v=1 should sample red"
+    assert (vc[small_v, 2] > vc[small_v, 0]).all(), "verts near v=0 should sample blue"
 
 
 def test_export_colored_mesh_ply_mixed_tessellated_and_flat(tmp_path: Path) -> None:

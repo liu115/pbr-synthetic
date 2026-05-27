@@ -24,6 +24,7 @@ from numpy.typing import NDArray
 from src.camera_sampling import CameraPose
 from src.io_utils import Intrinsics
 from src.pose_utils import pose_to_c2w  # re-exported for backward compatibility
+from src.scene_utils import R_MITSUBA_TO_BLENDER_4 as _M_Y_UP_TO_Z_UP
 
 __all__ = [
     "AOVImages",
@@ -68,7 +69,7 @@ class AOVImages:
     tests construct fake ``AOVImages`` instances.
     """
 
-    depth: NDArray[np.float32]
+    depth: NDArray[np.float32]                           # perspective z-depth (m)
     normal: NDArray[np.float32]
     albedo: NDArray[np.float32]                          # k_d (Cycles DiffCol)
     shape_index: NDArray[np.int32]
@@ -79,16 +80,6 @@ class AOVImages:
     metallic_per_pixel: NDArray[np.float32] | None = None   # shader AOV
 
 
-# Rotation that maps Mitsuba's Y-up world to Blender's Z-up world (this is what
-# the mitsuba-blender addon applies on import). Multiplying on the LEFT
-# transforms vectors / matrices from Mitsuba space into Blender space.
-_M_Y_UP_TO_Z_UP: NDArray[np.float64] = np.array(
-    [[1.0,  0.0,  0.0, 0.0],
-     [0.0,  0.0, -1.0, 0.0],
-     [0.0,  1.0,  0.0, 0.0],
-     [0.0,  0.0,  0.0, 1.0]],
-    dtype=np.float64,
-)
 
 
 def _build_sensor(

@@ -37,7 +37,7 @@ from numpy.typing import NDArray
 
 from src.camera_sampling import CameraPose
 from src.io_utils import Intrinsics
-from src.pose_utils import pose_to_c2w
+from src.pose_utils import pose_to_c2w_opencv
 from src.render_blender import (
     _clear_compositor,
     _make_file_output,
@@ -87,25 +87,25 @@ class EnvmapConfig:
 
 def _backproject_pixel(
     px: float, py: float,
-    depth_t: float,
+    depth_z: float,
     intrinsics: Intrinsics,
     c2w: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Back-project image pixel ``(px, py)`` with ray-distance ``depth_t`` to world space.
+    """Back-project image pixel ``(px, py)`` with perspective z-depth to world space.
 
-    ``depth_t`` is the ray.t convention used everywhere else in this repo:
-    distance from camera origin along the unit ray through the pixel. ``c2w``
-    is the OpenCV-convention camera-to-world matrix from :func:`pose_to_c2w`.
+    ``depth_z`` is the camera-space +Z distance (NOT ray-t): the EXR-on-disk
+    convention used by ``depth/{i:04d}.exr``. ``c2w`` is the OpenCV-convention
+    camera-to-world matrix from :func:`pose_to_c2w_opencv`.
     """
     u = (px - intrinsics.cx) / intrinsics.fl_x
     v = (py - intrinsics.cy) / intrinsics.fl_y
-    # OpenCV camera convention: +Z forward, +Y down (we use it consistently
-    # in transforms.json and pose_to_c2w).
-    ray_cam = np.array([u, v, 1.0], dtype=np.float64)
-    ray_cam /= np.linalg.norm(ray_cam)
-    world_dir = c2w[:3, :3] @ ray_cam
-    origin = c2w[:3, 3]
-    return origin + depth_t * world_dir
+    # OpenCV camera frame: +X right, +Y down, +Z forward. With z-depth, the
+    # camera-space surface point is simply (u * z, v * z, z).
+    cam_pt = np.array([u * depth_z, v * depth_z, depth_z], dtype=np.float64)
+    return cast(
+        NDArray[np.float64],
+        c2w[:3, :3] @ cam_pt + c2w[:3, 3],
+    )
 
 
 def _local_frame_from_normal(
@@ -113,11 +113,13 @@ def _local_frame_from_normal(
 ) -> NDArray[np.float64]:
     """Build a 3x3 rotation matrix whose +Y column is ``normal``.
 
-    Columns are (right, up=normal, back). The right axis is cross(normal,
-    world_up); when normal is parallel to world_up we fall back to world_x.
+    Columns are (right, up=normal, back). The right axis is
+    ``cross(normal, world_up)`` where the world's up axis is Z (this is the
+    sampling-frame convention). When ``normal`` is parallel to the world up
+    we fall back to world-X as the reference.
     """
     n = normal / max(float(np.linalg.norm(normal)), 1e-9)
-    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     if abs(float(np.dot(n, world_up))) > 0.99:
         world_up = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     right = np.cross(n, world_up)
@@ -205,8 +207,8 @@ def render_envmaps_for_frame(
 ) -> NDArray[np.float32]:
     """Render the SV envmap grid for one camera frame.
 
-    ``depth`` is the ray-t map (meters from camera origin) and ``normal`` is
-    the world-space surface normal — both straight from
+    ``depth`` is the perspective z-depth map (camera-space +Z, in meters)
+    and ``normal`` is the world-space surface normal — both straight from
     :func:`src.render_blender.render_aov_blender`. Pixels with non-finite
     depth (no surface hit) fall back to rendering the envmap at the camera
     origin so the mosaic stays a valid, finite tensor.
@@ -236,7 +238,7 @@ def render_envmaps_for_frame(
     )
     _set_samples(bpy, spp=cfg.spp, max_depth=cfg.max_depth, denoise=True)
 
-    c2w = pose_to_c2w(pose).astype(np.float64)
+    c2w = pose_to_c2w_opencv(pose).astype(np.float64)
     cam_origin = np.asarray(pose.position, dtype=np.float64)
 
     with tempfile.TemporaryDirectory(prefix="pbr_envmap_") as td:
@@ -246,9 +248,9 @@ def render_envmaps_for_frame(
                 # Anchor pixel: centre of this grid cell.
                 py = min(int((i + 0.5) * cfg.patch_size), h - 1)
                 px = min(int((j + 0.5) * cfg.patch_size), w - 1)
-                t = float(depth[py, px])
+                z = float(depth[py, px])
                 n = np.asarray(normal[py, px], dtype=np.float64)
-                if not np.isfinite(t) or t <= 0.0 or float(np.linalg.norm(n)) < 1e-6:
+                if not np.isfinite(z) or z <= 0.0 or float(np.linalg.norm(n)) < 1e-6:
                     # No surface here — anchor the envmap at the camera origin
                     # with the camera's local up axis as the "normal" so the
                     # resulting envmap is at least valid (free-space lighting
@@ -257,7 +259,7 @@ def render_envmaps_for_frame(
                     surf_n = pose.world_up()
                 else:
                     surface_pt = _backproject_pixel(
-                        float(px) + 0.5, float(py) + 0.5, t, intrinsics, c2w
+                        float(px) + 0.5, float(py) + 0.5, z, intrinsics, c2w
                     )
                     surf_n = n
 

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from src.camera_sampling import CameraPose
-from src.pose_utils import pose_to_c2w
+from src.pose_utils import pose_to_c2w, pose_to_c2w_opencv
 
 
 _POSES = [
@@ -41,6 +41,48 @@ def test_pose_to_c2w_forward_axis_matches_pose_forward() -> None:
     for pose in _POSES:
         m = pose_to_c2w(pose)
         np.testing.assert_allclose(m[:3, 2], pose.forward(), atol=1e-10)
+
+
+def test_pose_to_c2w_opencv_is_rigid() -> None:
+    """OpenCV-convention c2w should also be a proper SE(3) transform."""
+    for pose in _POSES:
+        m = pose_to_c2w_opencv(pose)
+        assert m.shape == (4, 4)
+        R = m[:3, :3]
+        np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-9)
+        assert np.linalg.det(R) > 0
+        np.testing.assert_allclose(m[:3, 3], np.asarray(pose.position), atol=1e-12)
+
+
+def test_pose_to_c2w_opencv_forward_axis_matches_pose_forward() -> None:
+    """Column 2 of the OpenCV c2w is the look direction (= ``pose.forward()``)."""
+    for pose in _POSES:
+        m = pose_to_c2w_opencv(pose)
+        np.testing.assert_allclose(m[:3, 2], pose.forward(), atol=1e-10)
+
+
+def test_pose_to_c2w_opencv_basis_directions() -> None:
+    """col 0 = right (cross(forward, up)), col 1 = down (= -col1 of look_at)."""
+    for pose in _POSES:
+        m_cv = pose_to_c2w_opencv(pose)
+        forward = pose.forward()
+        up = pose.world_up()
+        expected_right = np.cross(forward, up)
+        expected_right /= np.linalg.norm(expected_right)
+        np.testing.assert_allclose(m_cv[:3, 0], expected_right, atol=1e-10)
+        # col 1 should be ``cross(forward, col 0)`` — points in the image-down
+        # direction (which is the negation of the look-at convention's +Y).
+        m_lookat = pose_to_c2w(pose)
+        np.testing.assert_allclose(m_cv[:3, 1], -m_lookat[:3, 1], atol=1e-10)
+
+
+def test_pose_to_c2w_opencv_equivalent_to_diag_flip() -> None:
+    """For non-degenerate poses: pose_to_c2w_opencv == pose_to_c2w @ diag(-1,-1,1,1)."""
+    flip = np.diag([-1.0, -1.0, 1.0, 1.0])
+    for pose in _POSES:
+        np.testing.assert_allclose(
+            pose_to_c2w_opencv(pose), pose_to_c2w(pose) @ flip, atol=1e-10
+        )
 
 
 @pytest.mark.mitsuba_slow

@@ -105,9 +105,13 @@ conda run -n mitsuba python -m src.render_scene \
   metadata.json                  Render config, seeds, exposure, stats
 ```
 
-`transforms.json` is OpenCV convention (camera +Z forward, +Y down).
-`coordinate_convention: "opencv"` is set explicitly. Depth values are
-`ray.t`, NOT perspective Z-depth; this is recorded in `metadata.depth_convention`.
+`transforms.json` uses OpenCV camera convention (`+X right, +Y down, +Z
+forward`) in a Z-up world. The header carries `coordinate_convention:
+"opencv"`, `world_up_axis: "z"`, and `depth_format: "z_depth_meters"`. Depth
+EXRs store perspective z-depth (camera-space `+Z`, in meters), so they feed
+straight into Open3D / COLMAP / NeRF / 3DGS without conversion. `scene.ply`
+is exported in the same Z-up world frame as the saved poses, so it overlays
+the fused TSDF mesh and frustums directly.
 
 Per-pixel `roughness` / `metallic` come from a per-shape best-effort lookup
 (see `metadata.aov_caveats`). For the bedroom + kitchen scenes (mostly diffuse

@@ -4,8 +4,8 @@ The fused mesh is a sanity check on the camera-coordinate-system chain
 end-to-end: if the depth values, c2w poses, and intrinsics in
 ``transforms.json`` line up, dropping every frame into a TSDF volume should
 reconstruct a recognisable copy of the room. Compare against the renderer's
-own ``scene.ply`` (which is exported straight from the Mitsuba XML) — the
-two meshes should overlap in MeshLab when both are loaded.
+own ``scene.ply`` (which is exported via the same pipeline) — both live in
+the Blender Z-up world frame, so they overlap directly in MeshLab.
 
 Usage::
 
@@ -13,23 +13,16 @@ Usage::
 
 The default output is ``<data>/fused.ply``.
 
-Conventions handled:
+Conventions (as of the post-OpenCV-cleanup output schema):
 
-* ``depth/{idx:04d}.exr`` stores ``ray.t`` (distance from camera origin
-  along the unit ray through each pixel). Open3D's TSDF expects perspective
-  z-depth (the +Z component in camera space), so we divide by
-  ``sqrt(1 + u^2 + v^2)`` before integrating.
-* ``transforms.json[frames][i].transform_matrix`` is c2w in Mitsuba/look_at
-  convention (+X = ``cross(up, forward)`` = camera-LEFT in world coords,
-  +Y up in camera frame, +Z = forward). Open3D follows OpenCV
-  (+X = camera right, +Y = image down, +Z forward), so we flip cols 0 and 1
-  before inverting to a world-to-camera extrinsic.
-* Poses are sampled in the Blender Z-up world (because SceneInfo is derived
-  from Blender after the mitsuba-blender addon's Y-up→Z-up rotation). The
-  default ``--world-frame mitsuba`` left-multiplies by the inverse addon
-  rotation so the fused mesh lands in the original Mitsuba Y-up frame,
-  directly comparable to ``scene.ply``. Pass ``--world-frame blender`` to
-  skip that rotation.
+* ``depth/{idx:04d}.exr`` is perspective z-depth in meters (camera-space +Z).
+  Open3D's TSDF wants exactly this — no conversion needed.
+* ``transforms.json[frames][i].transform_matrix`` is c2w in OpenCV
+  convention (+X right, +Y down, +Z forward). Invert directly to get the
+  world-to-camera extrinsic.
+* ``scene.ply`` and the c2w poses share the Blender Z-up world. Pass
+  ``--world-frame mitsuba`` to rotate the output mesh to the original
+  Mitsuba Y-up frame instead.
 """
 
 from __future__ import annotations
@@ -37,44 +30,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
 import open3d as o3d  # type: ignore[import-not-found]
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.scene_utils import R_MITSUBA_TO_BLENDER_4  # noqa: E402
+
 log = logging.getLogger(__name__)
 
-# Rotation the mitsuba-blender addon applies on import: Mitsuba Y-up → Blender
-# Z-up. ``R @ p_mitsuba = p_blender``. Inverse goes the other way.
-_R_MITSUBA_TO_BLENDER = np.array(
-    [[1.0,  0.0,  0.0],
-     [0.0,  0.0, -1.0],
-     [0.0,  1.0,  0.0]],
-    dtype=np.float64,
-)
-_R_BLENDER_TO_MITSUBA_4 = np.eye(4, dtype=np.float64)
-_R_BLENDER_TO_MITSUBA_4[:3, :3] = _R_MITSUBA_TO_BLENDER.T
-
-# Flip cols 0 and 1 of a c2w to convert from Mitsuba/look_at camera convention
-# (+X = cross(up, forward) = world left, +Y = camera up) to OpenCV (+X = camera
-# right, +Y = image down). +Z (forward) stays.
-_LOOKAT_TO_OPENCV = np.diag([-1.0, -1.0, 1.0, 1.0])
-
-
-def _ray_t_to_z_depth(
-    ray_t: np.ndarray, fx: float, fy: float, cx: float, cy: float
-) -> np.ndarray:
-    """Inverse of the renderer's perspective-z → ray-t conversion."""
-    h, w = ray_t.shape
-    py, px = np.meshgrid(
-        np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32),
-        indexing="ij",
-    )
-    u = (px - cx) / fx
-    v = (py - cy) / fy
-    scale = np.sqrt(1.0 + u * u + v * v).astype(np.float32)
-    return ray_t / scale
+# Rotation from the Blender Z-up world back to the Mitsuba Y-up world (used
+# only when --world-frame mitsuba is requested).
+_R_BLENDER_TO_MITSUBA_4 = R_MITSUBA_TO_BLENDER_4.T
 
 
 def _resolve_rgb_path(
@@ -103,7 +73,7 @@ def fuse(
     data_dir: Path,
     out_path: Path,
     backend: str | None = None,
-    world_frame: str = "mitsuba",
+    world_frame: str = "blender",
     voxel_length: float = 0.05,
     sdf_trunc: float = 0.20,
     depth_trunc: float = 8.0,
@@ -119,11 +89,6 @@ def fuse(
         cx=float(transforms["cx"]),
         cy=float(transforms["cy"]),
     )
-    fx = float(transforms["fl_x"])
-    fy = float(transforms["fl_y"])
-    cx = float(transforms["cx"])
-    cy = float(transforms["cy"])
-
     if backend is None:
         backend = _detect_backend(transforms)
         log.info("Auto-detected backend: %s", backend)
@@ -154,13 +119,12 @@ def fuse(
             rgb = np.stack([rgb] * 3, axis=-1)
         rgb = np.ascontiguousarray(rgb[..., :3])
 
-        ray_t = np.asarray(
+        z_depth = np.asarray(
             imageio.imread(depth_path, format="EXR-FI"),  # type: ignore[arg-type]
             dtype=np.float32,
         )
-        if ray_t.ndim == 3:
-            ray_t = ray_t[..., 0]
-        z_depth = _ray_t_to_z_depth(ray_t, fx, fy, cx, cy)
+        if z_depth.ndim == 3:
+            z_depth = z_depth[..., 0]
         z_depth = np.where(
             np.isfinite(z_depth) & (z_depth > 0.0) & (z_depth < depth_trunc),
             z_depth,
@@ -168,14 +132,13 @@ def fuse(
         ).astype(np.float32)
         z_depth = np.ascontiguousarray(z_depth)
 
-        # Build extrinsic. transforms.json stores c2w in Mitsuba/look_at
-        # convention in Blender's Z-up world frame (because that's the
-        # frame the sampler ran in).
+        # transforms.json stores c2w in OpenCV convention in the Blender Z-up
+        # world frame. Optionally rotate to Mitsuba Y-up for users who want
+        # the original XML coordinate system.
         c2w = np.asarray(frame["transform_matrix"], dtype=np.float64)
         if world_frame == "mitsuba":
             c2w = _R_BLENDER_TO_MITSUBA_4 @ c2w
-        c2w_cv = c2w @ _LOOKAT_TO_OPENCV
-        extrinsic = np.linalg.inv(c2w_cv)
+        extrinsic = np.linalg.inv(c2w)
 
         color_img = o3d.geometry.Image(rgb)
         depth_img = o3d.geometry.Image(z_depth)
@@ -216,8 +179,10 @@ def main() -> int:
                     help="Output PLY path (default: <data>/fused.ply).")
     ap.add_argument("--backend", choices=["blender", "mitsuba"], default=None,
                     help="Which RGB source to fuse. Default: auto-detect.")
-    ap.add_argument("--world-frame", choices=["mitsuba", "blender"], default="mitsuba",
-                    help="Frame for the output mesh. 'mitsuba' aligns with scene.ply.")
+    ap.add_argument("--world-frame", choices=["mitsuba", "blender"], default="blender",
+                    help="Frame for the output mesh. 'blender' (default) "
+                         "aligns with scene.ply and the saved poses; 'mitsuba' "
+                         "rotates back to the original XML Y-up frame.")
     ap.add_argument("--voxel-length", type=float, default=0.05)
     ap.add_argument("--sdf-trunc", type=float, default=0.20)
     ap.add_argument("--depth-trunc", type=float, default=8.0,
@@ -250,5 +215,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

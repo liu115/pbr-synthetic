@@ -93,10 +93,12 @@ def test_write_transforms_json_payload(tmp_output_dir: Path) -> None:
     intr = compute_intrinsics(60.0, 640, 480)
     frames = [build_frame_record(0, np.eye(4))]
     out = tmp_output_dir / TRANSFORMS_FILENAME
-    write_transforms_json(out, intr, "y", frames)
+    write_transforms_json(out, intr, "z", frames)
     loaded = json.loads(out.read_text())
     assert loaded["coordinate_convention"] == "opencv"
-    assert loaded["up_axis"] == "y"
+    assert loaded["world_up_axis"] == "z"
+    assert loaded["depth_format"] == "z_depth_meters"
+    assert loaded["up_axis"] == "z"  # legacy alias kept for visualizer
     assert loaded["w"] == 640
     assert loaded["h"] == 480
     assert loaded["camera_angle_x"] == pytest.approx(intr.fov_x_rad)

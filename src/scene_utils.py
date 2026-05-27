@@ -22,6 +22,17 @@ _AXIS_INDEX: dict[UpAxis, int] = {"x": 0, "y": 1, "z": 2}
 # extraction). Matched case-insensitively as a substring of the shape ID.
 _ROOM_SHELL_PATTERN = re.compile(r"(wall|floor|ceiling|skirting)", re.IGNORECASE)
 
+# Rotation applied by the mitsuba-blender addon when it imports a Mitsuba
+# scene: Mitsuba Y-up -> Blender Z-up. ``R @ p_mitsuba == p_blender``.
+R_MITSUBA_TO_BLENDER: NDArray[np.float64] = np.array(
+    [[1.0, 0.0, 0.0],
+     [0.0, 0.0, -1.0],
+     [0.0, 1.0, 0.0]],
+    dtype=np.float64,
+)
+R_MITSUBA_TO_BLENDER_4: NDArray[np.float64] = np.eye(4, dtype=np.float64)
+R_MITSUBA_TO_BLENDER_4[:3, :3] = R_MITSUBA_TO_BLENDER
+
 
 @dataclass(slots=True, frozen=True)
 class SceneInfo:

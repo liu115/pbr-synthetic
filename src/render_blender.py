@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 
 from src.camera_sampling import CameraPose
 from src.io_utils import Intrinsics
-from src.pose_utils import pose_to_c2w
+from src.pose_utils import pose_to_c2w_opencv
 from src.render import AOVImages  # re-used: identical shape contract
 from src.scene_blender import _import_bpy
 
@@ -29,22 +29,10 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 
-# Convert a pose_to_c2w matrix (which mirrors Mitsuba's ScalarTransform4f.look_at:
-# col0 = cross(up, forward), col1 = cross(forward, col0), col2 = forward, +Y up,
-# +Z forward) to a Blender camera matrix_world.
-#
-# Two columns must flip:
-#   * Z column: Blender's camera looks down LOCAL -Z, while pose_to_c2w's Z is the
-#     forward direction; negating Z reverses the look axis so Blender's -Z lines
-#     up with the same world direction Mitsuba renders down +Z.
-#   * X column: Mitsuba's perspective sensor renders so that world +X appears on
-#     image-right even though pose_to_c2w's local +X = cross(up, forward) points
-#     to the camera's LEFT in world coordinates (this is an implicit x-flip
-#     inside Mitsuba's projection). Blender does not do this implicit flip — it
-#     treats col-0 literally as image-right. Without the additional X negation
-#     here the Blender image comes out HORIZONTALLY MIRRORED relative to
-#     Mitsuba, which is the regression --backend=both surfaced.
-_OPENCV_TO_BLENDER_CAM = np.diag([-1.0, 1.0, -1.0, 1.0])
+# Convert an OpenCV-convention c2w (col 0 = right, col 1 = down, col 2 = forward)
+# to Blender's camera ``matrix_world`` convention (col 0 = right, col 1 = up,
+# col 2 = back). Negate col 1 (down -> up) and col 2 (forward -> back).
+_OPENCV_TO_BLENDER_CAM = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 # ---- Camera placement -------------------------------------------------------
@@ -69,7 +57,7 @@ def set_camera(pose: CameraPose, intrinsics: Intrinsics) -> Any:
     bpy = _import_bpy()
     cam_obj = _ensure_camera(bpy)
 
-    c2w_cv = pose_to_c2w(pose)
+    c2w_cv = pose_to_c2w_opencv(pose)
     c2w_bl = c2w_cv @ _OPENCV_TO_BLENDER_CAM
 
     import mathutils  # type: ignore[import-not-found]
@@ -425,22 +413,12 @@ def _read_exr(path: Path) -> NDArray[np.float32]:
     return img
 
 
-# ---- Z (camera-space) -> ray.t conversion -----------------------------------
+# ---- Depth sanitization -----------------------------------------------------
 
 
-def _ray_t_from_z(z: NDArray[np.float32], intrinsics: Intrinsics) -> NDArray[np.float32]:
-    """Convert a Cycles Z pass (camera-space perpendicular depth) to ray distance."""
-    h, w = z.shape[:2]
-    px = np.arange(w, dtype=np.float32)
-    py = np.arange(h, dtype=np.float32)
-    u = (px[None, :] - float(intrinsics.cx)) / float(intrinsics.fl_x)
-    v = (py[:, None] - float(intrinsics.cy)) / float(intrinsics.fl_y)
-    scale = np.sqrt(1.0 + u * u + v * v).astype(np.float32)
-    out = z * scale
-    # Cycles writes 1e10 (or similar large value) for "no hit". Treat them as +inf
-    # for consistency with the Mitsuba pipeline.
-    out = np.where(np.isfinite(z) & (z < 1e9), out, np.float32(np.inf))
-    return out
+def _sanitize_depth(z: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Convert Cycles' "no hit" sentinel (1e10) to +inf; keep perspective z otherwise."""
+    return np.where(np.isfinite(z) & (z < 1e9), z, np.float32(np.inf))
 
 
 # ---- Top-level render entry points ------------------------------------------
@@ -535,7 +513,7 @@ def render_aov_blender(
         rough_px = _to_value_channel(_read_exr(paths["shader_roughness"]))
         metal_px = _to_value_channel(_read_exr(paths["shader_metallic"]))
 
-    depth_t = _ray_t_from_z(z, intrinsics)
+    depth_z = _sanitize_depth(z)
     if normal.ndim != 3 or normal.shape[-1] < 3:
         raise RuntimeError(f"Unexpected normal shape {normal.shape}")
     normal = np.ascontiguousarray(normal[..., :3], dtype=np.float32)
@@ -553,7 +531,7 @@ def render_aov_blender(
     material_index = np.rint(mat_idx).astype(np.int32)
 
     return AOVImages(
-        depth=depth_t,
+        depth=depth_z,
         normal=normal,
         albedo=albedo,
         shape_index=shape_index,
@@ -589,7 +567,7 @@ def render_depth_for_filter_blender(
         z = _read_exr(paths["depth"])
         if z.ndim == 3:
             z = z[..., 0]
-    return _ray_t_from_z(z.astype(np.float32), intrinsics)
+    return _sanitize_depth(z.astype(np.float32))
 
 
 # ---- Material LUT -----------------------------------------------------------

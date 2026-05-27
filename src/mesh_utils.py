@@ -28,6 +28,8 @@ import numpy as np
 import trimesh
 from numpy.typing import NDArray
 
+from src.scene_utils import R_MITSUBA_TO_BLENDER_4
+
 log = logging.getLogger(__name__)
 
 _DEFAULT_MESH_COLOR: tuple[float, float, float] = (0.7, 0.7, 0.7)
@@ -808,6 +810,12 @@ def export_colored_mesh_ply(
     )
     if mesh is None:
         return None
+    # Rotate from the Mitsuba XML's Y-up world to Blender's Z-up world so the
+    # exported PLY shares the same world frame as the saved camera poses
+    # (which are sampled in Blender after the mitsuba-blender addon's
+    # Y-up -> Z-up rotation). Trimesh's ``apply_transform`` rotates both
+    # vertex positions and normals.
+    mesh.apply_transform(R_MITSUBA_TO_BLENDER_4)
     ply_path.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(str(ply_path), file_type="ply")
     summary_obj = mesh.metadata.get("mesh_export_summary", []) if mesh.metadata else []
