@@ -44,7 +44,7 @@ for scene in ${SCENES[@]}; do
     continue
   fi
   echo "==> Rendering $scene -> $out (backend=$BACKEND sampler=$SAMPLER)"
-  python -m src.render_scene \
+  python scripts/render_scene.py \
     --scene "$xml" \
     --output "$out" \
     --num-cameras "$N_CAMERAS" \

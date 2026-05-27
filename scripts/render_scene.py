@@ -34,6 +34,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
+# Make ``src`` importable when this script is run directly
+# (``python scripts/render_scene.py ...``).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 import yaml
 from numpy.typing import NDArray

@@ -20,7 +20,7 @@ conda activate mitsuba-blender
 ## Render a scene
 
 ```bash
-python -m src.render_scene \
+python scripts/render_scene.py \
     --scene /path/to/scene_v3.xml \
     --output /path/to/out \
     --num-cameras 200 \
@@ -78,7 +78,7 @@ See `docs/operational.md` for `scene_config.yaml`, resume behavior, and
 ## Visualizer
 
 ```bash
-python src/visualize.py --data /path/to/out --port 8080
+python scripts/visualize.py --data /path/to/out --port 8080
 ```
 
 Viser server showing the colored mesh + every camera frustum (colored by

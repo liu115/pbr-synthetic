@@ -32,6 +32,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import imageio.v2 as imageio
 import numpy as np
@@ -48,7 +49,7 @@ _R_BLENDER_TO_MITSUBA_4 = R_MITSUBA_TO_BLENDER_4.T
 
 
 def _resolve_rgb_path(
-    data_dir: Path, frame: dict, backend: str
+    data_dir: Path, frame: dict[str, Any], backend: str
 ) -> Path | None:
     """Find the LDR RGB PNG for ``backend`` within a transforms.json frame."""
     key = f"file_path_{backend}"
@@ -59,7 +60,7 @@ def _resolve_rgb_path(
     return p if p.exists() else None
 
 
-def _detect_backend(transforms: dict) -> str:
+def _detect_backend(transforms: dict[str, Any]) -> str:
     """Pick a backend that actually has files written."""
     first = transforms["frames"][0]
     for b in ("blender", "mitsuba"):

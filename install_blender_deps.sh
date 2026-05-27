@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # Install Blender-pipeline dependencies into the currently active Python env.
 #
-# Unlike install_blender_env.sh, this script does NOT create or manage an
-# env — it assumes you've already created and activated whatever env you
-# prefer (conda, venv, uv, mamba, pyenv, ...) and only installs the pip
-# packages + the mitsuba-blender add-on into it.
-#
 # Requirements:
 #   - Python 3.11 (bpy 4.2 LTS pins this version)
 #   - `python` and `pip` on PATH and pointing at the env you want
@@ -59,7 +54,7 @@ echo "==> Installing + patching the mitsuba-blender add-on..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 set +e
-python -m src.render_scene --install-addon-only
+python scripts/render_scene.py --install-addon-only
 addon_rc=$?
 set -e
 
@@ -77,7 +72,7 @@ fi
 
 echo ""
 echo "==> Done. Run a debug render with:"
-echo "      python -m src.render_scene \\"
+echo "      python scripts/render_scene.py \\"
 echo "          --scene /path/to/scene_v3.xml \\"
 echo "          --output /tmp/out --num-cameras 4 --debug --seed 42 \\"
 echo "          --cycles-device CPU --denoiser NONE"

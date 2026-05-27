@@ -1,4 +1,4 @@
-"""Unit tests for the XML parsing helpers in src/visualize.py."""
+"""Unit tests for the XML parsing helpers in scripts/visualize.py."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 import trimesh
 
-from src.visualize import (
+from scripts.visualize import (
     _DEFAULT_MESH_COLOR,
     _parse_rgb_string,
     clip_top_percentile,

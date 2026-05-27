@@ -11,6 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Make ``src`` importable when this script is run directly
+# (``python scripts/visualize.py ...``).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import imageio.v2 as imageio
 import numpy as np
 import trimesh

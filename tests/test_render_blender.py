@@ -72,7 +72,7 @@ def test_blender_only_pipeline(tmp_path: Path) -> None:
     scene_xml = tmp_path / "scene.xml"
     scene_xml.write_text(_SCENE_XML)
     out = tmp_path / "out"
-    from src.render_scene import main as render_main
+    from scripts.render_scene import main as render_main
 
     rc = render_main(_common_args(scene_xml, out) + ["--backend", "blender"])
     assert rc == 0, "render_scene.main exited non-zero"
@@ -107,7 +107,7 @@ def test_both_backends_pipeline(tmp_path: Path) -> None:
     scene_xml = tmp_path / "scene.xml"
     scene_xml.write_text(_SCENE_XML)
     out = tmp_path / "out"
-    from src.render_scene import main as render_main
+    from scripts.render_scene import main as render_main
 
     rc = render_main(_common_args(scene_xml, out) + ["--backend", "both"])
     assert rc == 0, "render_scene.main exited non-zero"
@@ -136,7 +136,7 @@ def test_per_pixel_roughness_metallic_have_finite_values(tmp_path: Path) -> None
     scene_xml = tmp_path / "scene.xml"
     scene_xml.write_text(_SCENE_XML)
     out = tmp_path / "out"
-    from src.render_scene import main as render_main
+    from scripts.render_scene import main as render_main
 
     assert render_main(_common_args(scene_xml, out) + ["--backend", "blender"]) == 0
 
