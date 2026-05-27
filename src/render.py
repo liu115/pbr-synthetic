@@ -23,14 +23,12 @@ from numpy.typing import NDArray
 
 from src.camera_sampling import CameraPose
 from src.io_utils import Intrinsics
-from src.pose_utils import pose_to_c2w  # re-exported for backward compatibility
 from src.scene_utils import R_MITSUBA_TO_BLENDER_4 as _M_Y_UP_TO_Z_UP
 
 __all__ = [
     "AOVImages",
     "RenderConfig",
     "make_contact_sheet",
-    "pose_to_c2w",
     "render_beauty",
 ]
 

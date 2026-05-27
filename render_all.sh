@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Render the known scenes into /cluster_HDD/umoja/yliu/pbr-test/rendered/.
 #
-# Defaults to --backend=both (renders Mitsuba beauty AND Blender beauty into
-# the same output dir, with shared AOVs from Blender) and --sampler=wall_walk
-# (FIPT-style camera placement). Override via env vars; flip --remove-transparent
-# off by setting REMOVE_TRANSPARENT=0.
+# Activate the Blender-side env (e.g. `conda activate mitsuba-blender`) before
+# running. Defaults to --backend=both (renders Mitsuba beauty AND Blender
+# beauty into the same output dir, with shared AOVs from Blender) and
+# --sampler=wall_walk (FIPT-style camera placement). Override via env vars;
+# flip --remove-transparent off by setting REMOVE_TRANSPARENT=0.
 #
 # Usage:
 #   ./render_all.sh                          # full quality, both backends, wall_walk
@@ -13,7 +14,6 @@
 #   BACKEND=blender ./render_all.sh          # blender only
 #   SAMPLER=uniform ./render_all.sh          # use uniform sampler
 #   REMOVE_TRANSPARENT=0 ./render_all.sh     # keep glass shapes
-#   ENV_NAME=pbr-capture-blender ./render_all.sh   # custom conda env
 set -euo pipefail
 
 RAW_ROOT="${RAW_ROOT:-/cluster_HDD/umoja/yliu/pbr-test/raw}"
@@ -24,7 +24,6 @@ SCENES=("${SCENES:-bedroom kitchen}")
 BACKEND="${BACKEND:-both}"
 SAMPLER="${SAMPLER:-wall_walk}"
 REMOVE_TRANSPARENT="${REMOVE_TRANSPARENT:-1}"
-ENV_NAME="${ENV_NAME:-pbr-capture-blender-test}"
 
 EXTRA_FLAGS=()
 if [[ "${DEBUG:-0}" == "1" ]]; then
@@ -45,7 +44,7 @@ for scene in ${SCENES[@]}; do
     continue
   fi
   echo "==> Rendering $scene -> $out (backend=$BACKEND sampler=$SAMPLER)"
-  conda run -n "$ENV_NAME" --no-capture-output python -m src.render_scene \
+  python -m src.render_scene \
     --scene "$xml" \
     --output "$out" \
     --num-cameras "$N_CAMERAS" \

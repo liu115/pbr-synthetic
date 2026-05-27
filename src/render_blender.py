@@ -1,9 +1,17 @@
-"""Blender backend for camera placement, Cycles beauty / AOV rendering, BSDF probing.
+"""Blender backend: camera placement, Cycles beauty + AOV + depth-filter renders.
 
-Public functions mirror ``src/render.py`` (``render_beauty``, ``render_aov``,
-``render_depth_for_filter``, ``derive_material_lut``) so the orchestrator can
-swap backends with a one-line import change. ``AOVImages`` is re-exported from
-``src/render.py`` so downstream code is untouched.
+Public entry points:
+
+* :func:`render_beauty_blender` — HDR linear-radiance RGB via Cycles.
+* :func:`render_aov_blender` — depth, normal, albedo, specular albedo,
+  emission, object / material segmentation, plus per-pixel roughness +
+  metallic via :func:`setup_shader_aovs`.
+* :func:`render_depth_for_filter_blender` — fast low-resolution z-depth
+  used by the camera-validity sampler.
+
+``AOVImages`` is the shared dataclass defined in ``src/render.py``; it's
+imported here so callers can construct one without crossing module
+boundaries.
 """
 
 from __future__ import annotations
@@ -568,54 +576,3 @@ def render_depth_for_filter_blender(
         if z.ndim == 3:
             z = z[..., 0]
     return _sanitize_depth(z.astype(np.float32))
-
-
-# ---- Material LUT -----------------------------------------------------------
-
-
-def _principled_inputs(obj: Any) -> tuple[float, float]:
-    """Return (roughness, metallic) from the first Principled BSDF in obj's material.
-
-    Falls back to (1.0, 0.0) — same default as the Mitsuba ``diffuse`` fallback —
-    when no Principled BSDF is found.
-    """
-    if not obj.material_slots:
-        return 1.0, 0.0
-    mat = obj.material_slots[0].material
-    if mat is None or not mat.use_nodes or mat.node_tree is None:
-        return 1.0, 0.0
-    for node in mat.node_tree.nodes:
-        if node.bl_idname == "ShaderNodeBsdfPrincipled":
-            try:
-                r = float(node.inputs["Roughness"].default_value)
-            except (KeyError, TypeError):
-                r = 0.5
-            try:
-                m = float(node.inputs["Metallic"].default_value)
-            except (KeyError, TypeError):
-                m = 0.0
-            return r, m
-    return 1.0, 0.0
-
-
-def derive_material_lut_blender(
-    pass_index_to_object: dict[int, Any],
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Build per-pass-index (roughness, metallic) LUTs from Principled BSDFs.
-
-    Returned arrays have length ``max_pass_index + 1`` so they index directly
-    into the object-index AOV. Index 0 is the "no hit" sentinel (NaN).
-    """
-    if not pass_index_to_object:
-        return (
-            np.full(1, np.nan, dtype=np.float32),
-            np.full(1, np.nan, dtype=np.float32),
-        )
-    n = max(pass_index_to_object.keys()) + 1
-    rough = np.full(n, np.nan, dtype=np.float32)
-    metal = np.full(n, np.nan, dtype=np.float32)
-    for idx, obj in pass_index_to_object.items():
-        r, m = _principled_inputs(obj)
-        rough[idx] = float(r)
-        metal[idx] = float(m)
-    return rough, metal
