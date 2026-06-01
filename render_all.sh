@@ -20,7 +20,7 @@ RAW_ROOT="${RAW_ROOT:-/cluster_HDD/umoja/yliu/pbr-test/raw}"
 OUT_ROOT="${OUT_ROOT:-/cluster_HDD/umoja/yliu/pbr-test/rendered}"
 N_CAMERAS="${N_CAMERAS:-200}"
 SEED="${SEED:-42}"
-SCENES=("${SCENES:-bedroom kitchen}")
+SCENES=("${SCENES:-bedroom kitchen bathroom livingroom}")
 BACKEND="${BACKEND:-both}"
 SAMPLER="${SAMPLER:-wall_walk}"
 REMOVE_TRANSPARENT="${REMOVE_TRANSPARENT:-1}"
@@ -32,6 +32,8 @@ fi
 if [[ "$REMOVE_TRANSPARENT" == "1" ]]; then
   EXTRA_FLAGS+=("--remove-transparent")
 fi
+# All Bitterli scenes here are Y-up in XML → Z-up after the mitsuba-blender axis flip.
+EXTRA_FLAGS+=("--up-axis" "z")
 
 mkdir -p "$OUT_ROOT"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -44,12 +46,15 @@ for scene in ${SCENES[@]}; do
     continue
   fi
   echo "==> Rendering $scene -> $out (backend=$BACKEND sampler=$SAMPLER)"
-  python scripts/render_scene.py \
+  if ! python scripts/render_scene.py \
     --scene "$xml" \
     --output "$out" \
     --num-cameras "$N_CAMERAS" \
     --seed "$SEED" \
     --backend "$BACKEND" \
     --sampler "$SAMPLER" \
-    "${EXTRA_FLAGS[@]}"
+    "${EXTRA_FLAGS[@]}"; then
+    echo "[fail] $scene: render exited non-zero (continuing)" >&2
+  fi
+  sleep 1
 done
