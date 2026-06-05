@@ -93,15 +93,30 @@ def _set_resolution(bpy: Any, width: int, height: int) -> None:
     r.resolution_percentage = 100
 
 
+# Cycles `max_bounces` is a finite integer (no "unlimited" sentinel like Mitsuba's
+# max_depth=-1). Map -1 to a high cap; Russian roulette terminates most paths well
+# before this, so it doesn't waste much compute but matches Mitsuba's unbounded path.
+BLENDER_UNLIMITED_BOUNCES = 128
+
+
+def _cycles_bounce_cap(max_depth: int) -> int:
+    """Translate the pipeline's max_depth (Mitsuba convention, -1 == unlimited)
+    into a finite Cycles bounce count."""
+    if max_depth < 0:
+        return BLENDER_UNLIMITED_BOUNCES
+    return int(max_depth)
+
+
 def _set_samples(bpy: Any, spp: int, max_depth: int, *, denoise: bool) -> None:
     cy = bpy.context.scene.cycles
     cy.samples = int(spp)
     cy.use_adaptive_sampling = False
-    cy.max_bounces = int(max_depth)
-    cy.diffuse_bounces = int(max_depth)
-    cy.glossy_bounces = int(max_depth)
-    cy.transmission_bounces = int(max_depth)
-    cy.transparent_max_bounces = int(max_depth)
+    bounces = _cycles_bounce_cap(max_depth)
+    cy.max_bounces = bounces
+    cy.diffuse_bounces = bounces
+    cy.glossy_bounces = bounces
+    cy.transmission_bounces = bounces
+    cy.transparent_max_bounces = bounces
     vl = bpy.context.scene.view_layers[0]
     vl.cycles.use_denoising = bool(denoise)
 

@@ -143,7 +143,10 @@ _XML_TO_PROPS_POLYFILL = (
 
 
 def _patch_addon_for_compat(
-    addon_dir: Path, *, roughplastic_coat_weight: float = 0.8
+    addon_dir: Path,
+    *,
+    roughplastic_coat_weight: float = 0.0,
+    mirror_roughness: float | None = 0.0,
 ) -> None:
     """In-place patches to make mitsuba-blender v0.4.0 load against mitsuba 3.6+.
 
@@ -251,6 +254,19 @@ def _patch_addon_for_compat(
         roughplastic_coat_weight,
     )
 
+    # ----- Patch: mirror (delta conductor) Roughness. The addon's
+    # write_mi_conductor_bsdf never sets the Glossy `Roughness` socket, so a
+    # Mitsuba delta-mirror (`<bsdf type="conductor"/>`) inherits Cycles' default
+    # Roughness=0.5 and imports as a half-rough metal. Force it to
+    # ``mirror_roughness`` (0.0 == sharp). ``None`` disables the patch (baseline
+    # for A/B experiments). Runs after _patch_addon_for_bpy4, so the keyed
+    # ``= 'BECKMANN'`` lines already exist.
+    if mirror_roughness is not None:
+        _patch_mirror_roughness(
+            addon_dir / "io" / "importer" / "materials.py",
+            mirror_roughness,
+        )
+
     if n_ver == 0 and n_thr == 0:
         log.info("Top-level __init__.py compat patches already applied.")
 
@@ -277,6 +293,51 @@ def _patch_roughplastic_coat(materials_py: Path, coat_weight: float) -> None:
     if new_src != src:
         materials_py.write_text(new_src)
         log.info("Patched %d Coat Weight site(s) -> %s in materials.py", n, target)
+
+
+def _patch_mirror_roughness(materials_py: Path, roughness: float) -> None:
+    """Force a ``Roughness`` assignment after each smooth conductor/glass
+    ``.distribution = 'BECKMANN'`` line in the addon's materials.py.
+
+    The upstream ``write_mi_conductor_bsdf`` creates a ``ShaderNodeBsdfGlossy`` but
+    never writes its ``Roughness`` socket, so a Mitsuba delta ``conductor`` mirror
+    inherits Cycles' Glossy default (0.5) and renders as a half-rough metal — and
+    the shader-AOV roughness pass (which reads that socket) reports 0.5 too. We
+    inject ``<var>.inputs['Roughness'].default_value = <roughness>`` (0.0 == sharp).
+
+    Keys on the literal ``.distribution = 'BECKMANN'`` written by the SHARP->BECKMANN
+    bpy-4.x patch. That literal appears only in the *smooth* writers
+    (``conductor`` / ``dielectric`` / ``thindielectric``) and NOT in
+    ``roughconductor`` / ``roughdielectric`` (whose distribution is a function call),
+    so the rough variants keep their real roughness. The dielectric/thindielectric
+    Glass nodes already default to 0.0; setting it explicitly is defensive.
+
+    Idempotent: skips a site whose next line already sets that node's ``Roughness``.
+    """
+    if not materials_py.exists():
+        return
+    value = float(roughness)
+    lines = materials_py.read_text().splitlines(keepends=True)
+    pat = re.compile(r"^(\s*)(\w+)\.distribution\s*=\s*'BECKMANN'")
+    out: list[str] = []
+    n = 0
+    for i, line in enumerate(lines):
+        out.append(line)
+        m = pat.match(line)
+        if m is None:
+            continue
+        indent, var = m.group(1), m.group(2)
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if f"{var}.inputs['Roughness']" in nxt:
+            continue  # already patched -> idempotent
+        out.append(
+            f"{indent}{var}.inputs['Roughness'].default_value = {value}"
+            "  # patched: sharp delta reflector (mirror)\n"
+        )
+        n += 1
+    if n:
+        materials_py.write_text("".join(out))
+        log.info("Patched %d mirror Roughness site(s) -> %s in materials.py", n, value)
 
 
 def _patch_addon_for_bpy4(addon_dir: Path) -> None:
@@ -393,7 +454,11 @@ def _patch_addon_for_bpy4(addon_dir: Path) -> None:
 
 
 def _install_addon_from_zip(
-    bpy: Any, zip_path: Path, *, roughplastic_coat_weight: float = 0.8
+    bpy: Any,
+    zip_path: Path,
+    *,
+    roughplastic_coat_weight: float = 0.0,
+    mirror_roughness: float | None = 0.0,
 ) -> str:
     """Extract the addon manually, normalize the folder name to a Python identifier.
 
@@ -428,18 +493,24 @@ def _install_addon_from_zip(
                 shutil.copyfileobj(src, dst)
 
     _patch_addon_for_compat(
-        target_dir, roughplastic_coat_weight=roughplastic_coat_weight
+        target_dir,
+        roughplastic_coat_weight=roughplastic_coat_weight,
+        mirror_roughness=mirror_roughness,
     )
     return target_module
 
 
 def ensure_mitsuba_addon(
-    *, force_reinstall: bool = False, roughplastic_coat_weight: float = 0.8
+    *,
+    force_reinstall: bool = False,
+    roughplastic_coat_weight: float = 0.0,
+    mirror_roughness: float | None = 0.0,
 ) -> str:
     """Install + enable the mitsuba-blender addon. Returns the module name.
 
     Args:
-        force_reinstall: re-download + re-patch even if the addon is already enabled.
+        force_reinstall: re-extract + re-patch from the cached zip (re-downloads
+            only if the cache is missing) even if the addon is already enabled.
         roughplastic_coat_weight: value written into the addon's hardcoded
             ``Coat Weight`` slot for roughplastic/plastic BSDFs. The upstream
             default is 0.8 which makes Cycles renders much glossier than the
@@ -453,12 +524,16 @@ def ensure_mitsuba_addon(
             log.info("mitsuba-blender addon already enabled (%s)", existing)
             return existing
 
-    if not ADDON_CACHE_PATH.exists() or force_reinstall:
+    # Download only when the cached zip is missing. force_reinstall still
+    # re-extracts and re-applies all patches from the cached zip below, so it
+    # works offline and never swaps the pinned v0.4.0 release the patches target.
+    if not ADDON_CACHE_PATH.exists():
         _download_addon_zip(ADDON_CACHE_PATH)
 
     module_name = _install_addon_from_zip(
         bpy, ADDON_CACHE_PATH,
         roughplastic_coat_weight=roughplastic_coat_weight,
+        mirror_roughness=mirror_roughness,
     )
     # Tell Blender to rescan the scripts dir so the freshly-installed module
     # becomes visible to addon_enable.
@@ -473,7 +548,7 @@ def ensure_mitsuba_addon(
 
 
 def _configure_cycles(
-    bpy: Any, *, device: str = "OPTIX", denoiser: str = "OPTIX"
+    bpy: Any, *, device: str = "OPTIX", denoiser: str = "OPENIMAGEDENOISE"
 ) -> None:
     """Set engine to Cycles, pick the requested device, enable denoising."""
     scene = bpy.context.scene
@@ -521,13 +596,17 @@ def init_blender(
     *,
     ensure_addon: bool = True,
     device: str = "OPTIX",
-    denoiser: str = "OPTIX",
-    roughplastic_coat_weight: float = 0.8,
+    denoiser: str = "OPENIMAGEDENOISE",
+    roughplastic_coat_weight: float = 0.0,
+    mirror_roughness: float | None = 0.0,
 ) -> str:
     """Initialize Blender + Cycles for our pipeline. Returns the bpy version string."""
     bpy = _import_bpy()
     if ensure_addon:
-        ensure_mitsuba_addon(roughplastic_coat_weight=roughplastic_coat_weight)
+        ensure_mitsuba_addon(
+            roughplastic_coat_weight=roughplastic_coat_weight,
+            mirror_roughness=mirror_roughness,
+        )
     _configure_cycles(bpy, device=device, denoiser=denoiser)
     ver = ".".join(str(x) for x in bpy.app.version)
     log.info("Blender %s ready (engine=Cycles, device=%s, denoiser=%s)",

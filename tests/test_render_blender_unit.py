@@ -12,15 +12,26 @@ import numpy as np
 
 from src.render import AOVImages
 from src.render_blender import (
+    BLENDER_UNLIMITED_BOUNCES,
     _BSDF_METALLIC_DEFAULT,
     _BSDF_ROUGHNESS_DEFAULT,
     _BSDF_ROUGHNESS_USES_SOCKET,
     _SHADER_AOV_NAMES,
+    _cycles_bounce_cap,
 )
 
 
 def test_shader_aov_names_are_unique() -> None:
     assert sorted(_SHADER_AOV_NAMES) == ["PixelMetallic", "PixelRoughness"]
+
+
+def test_cycles_bounce_cap_maps_unlimited_sentinel() -> None:
+    """Mitsuba's max_depth=-1 (unlimited) maps to a finite Cycles cap; finite
+    values pass through unchanged."""
+    assert _cycles_bounce_cap(-1) == BLENDER_UNLIMITED_BOUNCES
+    assert _cycles_bounce_cap(8) == 8
+    assert _cycles_bounce_cap(0) == 0
+    assert _cycles_bounce_cap(64) == 64
 
 
 def test_diffuse_bsdf_reports_microfacet_fully_rough() -> None:

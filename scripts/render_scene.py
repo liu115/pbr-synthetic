@@ -124,7 +124,11 @@ DEFAULT_SPP_ENVMAP = 32
 
 DEFAULT_FOV = 60.0
 DEFAULT_NUM_CAMERAS = 200
-DEFAULT_MAX_DEPTH = 8
+# -1 == unlimited bounces (Russian-roulette bounded). Mitsuba's `path` integrator
+# accepts -1 directly; Cycles needs a finite cap, so render_blender._set_samples
+# maps -1 to BLENDER_UNLIMITED_BOUNCES. Matches the official FIPT XMLs, which set
+# no max_depth, and avoids the 5-15% indoor GI darkening of an 8-bounce cap.
+DEFAULT_MAX_DEPTH = -1
 
 DEFAULT_PLACEMENT_MARGIN = 0.5
 DEFAULT_HEIGHT_RANGE = (0.8, 1.8)
@@ -198,10 +202,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mitsuba-variant", type=str, default=None)
     # Blender-specific
     p.add_argument("--cycles-device", choices=["OPTIX", "CUDA", "CPU"], default="OPTIX")
-    p.add_argument("--denoiser", choices=["OPTIX", "OPENIMAGEDENOISE", "NONE"], default="OPTIX")
-    p.add_argument("--roughplastic-coat-weight", type=float, default=0.8,
+    p.add_argument("--denoiser", choices=["OPTIX", "OPENIMAGEDENOISE", "NONE"],
+                   default="OPENIMAGEDENOISE",
+                   help="Cycles denoiser. OIDN's chromatic bias is smaller and more "
+                        "spatially uniform than OptiX's, which the IRIS CRF can't absorb.")
+    p.add_argument("--roughplastic-coat-weight", type=float, default=0.0,
                    help="Coat weight for the mitsuba-blender Principled-BSDF mapping "
-                        "of roughplastic BSDFs. Lower values reduce specular gloss.")
+                        "of roughplastic/plastic BSDFs. Default 0.0 drops the clearcoat "
+                        "layer to match Mitsuba's roughplastic (the addon hardcodes 0.8).")
     # Envmap
     p.add_argument("--no-envmap", action="store_true",
                    help="Skip per-pixel envmap rendering (default off in --debug).")
@@ -667,8 +675,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.install_addon_only:
         from src.scene_blender import ensure_mitsuba_addon
-        module = ensure_mitsuba_addon()
-        log.info("mitsuba-blender addon ready (module=%s)", module)
+        # force_reinstall so re-running this re-extracts a clean addon and
+        # re-applies ALL patches (mirror Roughness, coat weight, bpy-4 compat).
+        # Without it an already-enabled addon is left untouched, so addon-patch
+        # changes pulled from git would silently not take effect.
+        module = ensure_mitsuba_addon(
+            force_reinstall=True,
+            roughplastic_coat_weight=args.roughplastic_coat_weight,
+        )
+        log.info("mitsuba-blender addon re-installed + patched (module=%s)", module)
         return 0
 
     if args.scene is None or args.output is None:
