@@ -638,10 +638,71 @@ def _wipe_default_scene(bpy: Any) -> None:
                 coll.remove(item)
             except (RuntimeError, ReferenceError):
                 continue
+    # Worlds: unlink from every scene and free the orphan datablocks. The default
+    # startup 'World' survives object removal otherwise, leaving a name collision
+    # that pushes the importer's fallback world to 'World.001' and piling up stale
+    # worlds across repeated load_scene_blender() calls in one process.
+    for s in bpy.data.scenes:
+        s.world = None
+    for w in list(bpy.data.worlds):
+        try:
+            bpy.data.worlds.remove(w)
+        except (RuntimeError, ReferenceError):
+            continue
+
+
+# Default Blender world Background colour the addon's create_default_bl_world()
+# installs when the XML has no environment emitter (io/importer/world.py).
+_DEFAULT_WORLD_GREY = 0.05087608844041824
+
+
+def _xml_has_env_emitter(scene_xml: Path) -> bool:
+    """True if the Mitsuba XML declares an environment emitter (``envmap`` or
+    ``constant``) that legitimately lights the scene through the world."""
+    try:
+        text = scene_xml.read_text(errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(r'<emitter\s+type\s*=\s*"(?:envmap|constant)"', text))
+
+
+def _neutralize_default_world(bpy: Any, scene_xml: Path) -> bool:
+    """Zero a phantom default world so Cycles matches Mitsuba's zero-radiance env.
+
+    The mitsuba-blender importer always leaves the scene with a World: one derived
+    from a ``<emitter type="envmap"|"constant"/>`` in the XML, or — when the XML has
+    no env emitter — a grey fallback (``create_default_bl_world``: Background colour
+    ~0.05088 @ Strength 1.0). Mitsuba treats "no env emitter" as zero radiance, so
+    that fallback injects phantom ambient that brightens escaping rays and biases the
+    Cycles beauty/AOVs. We set the Background to black @ Strength 0 — but only when the
+    XML declares no env emitter (so a real envmap/constant world is never touched).
+
+    Returns True if a world was neutralized.
+    """
+    scene = bpy.context.scene
+    world = scene.world
+    if world is None:
+        return False
+    if _xml_has_env_emitter(scene_xml):
+        return False  # XML asked for an environment -> keep the imported env world
+    if not getattr(world, "use_nodes", False) or world.node_tree is None:
+        world.use_nodes = True
+    nodes = world.node_tree.nodes
+    if any(n.bl_idname == "ShaderNodeTexEnvironment" for n in nodes):
+        return False  # image-based env without an XML emitter: leave it untouched
+    bg = next((n for n in nodes if n.bl_idname == "ShaderNodeBackground"), None)
+    if bg is None:
+        return False
+    bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    bg.inputs["Strength"].default_value = 0.0
+    log.info("Neutralized phantom default world (Strength->0) for %s", scene_xml.name)
+    return True
 
 
 def load_scene_blender(
     scene_xml: Path,
+    *,
+    wipe_world: bool = True,
 ) -> tuple[dict[int, Any], dict[int, Any]]:
     """Clear the current Blender scene and import a Mitsuba XML.
 
@@ -687,6 +748,13 @@ def load_scene_blender(
     # scene.render.engine = 'MITSUBA' (the addon's own render engine, which
     # we don't want — we render with Cycles). Force Cycles back.
     bpy.context.scene.render.engine = "CYCLES"
+
+    # Remove the importer's phantom grey world for closed scenes (no env emitter),
+    # so Cycles doesn't add ambient that Mitsuba (and IRIS) can't represent. A real
+    # envmap/constant world declared in the XML is preserved. ``wipe_world=False``
+    # disables this (baseline for the world-dimming A/B experiment).
+    if wipe_world:
+        _neutralize_default_world(bpy, scene_xml)
 
     obj_mapping: dict[int, Any] = {}
     next_idx = 1
